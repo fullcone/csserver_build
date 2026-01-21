@@ -2498,7 +2498,6 @@ void EXT_FUNC SV_ConnectClient_internal(void)
 	host_client->next_messagetime = realtime + 0.05;
 	host_client->delta_sequence = -1;
 	Q_memset(&host_client->lastcmd, 0, sizeof(usercmd_t));
-	host_client->lastcmd_himsec = 0;  // 初始化高精度时间
 	host_client->nextping = -1.0;
 	if (host_client->netchan.remote_address.type == NA_LOOPBACK)
 	{
