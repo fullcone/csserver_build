@@ -601,24 +601,21 @@ jobs:
           }' regamedll/dlls/player.cpp
 
       - name: Apply pm_shared himsec patch
+        working-directory: regamedll
         run: |
-          echo "=== Debug: workspace info ==="
-          pwd
-          ls -la
-          echo "=== Debug: list patches ==="
-          find . -maxdepth 3 -type f -name "pm_shared_himsec.patch" -print
+          echo "=== Applying pm_shared himsec patch ==="
           
-          if [ -f patches/ReGameDLL/pm_shared_himsec.patch ]; then
-            PATCH_PATH="patches/ReGameDLL/pm_shared_himsec.patch"
-          elif [ -f github/patches/ReGameDLL/pm_shared_himsec.patch ]; then
-            PATCH_PATH="github/patches/ReGameDLL/pm_shared_himsec.patch"
+          # Patch file is in github/patches/ReGameDLL/
+          if [ -f ../github/patches/ReGameDLL/pm_shared_himsec.patch ]; then
+            echo "Found patch at ../github/patches/ReGameDLL/pm_shared_himsec.patch"
+            patch -p1 < ../github/patches/ReGameDLL/pm_shared_himsec.patch
+            echo "✓ Patch applied successfully"
           else
             echo "ERROR: patch file not found"
+            echo "Looking for patch file..."
+            find .. -name "pm_shared_himsec.patch" -type f
             exit 1
           fi
-          
-          echo "Applying patch: $PATCH_PATH"
-          patch -p1 < "$PATCH_PATH"
 
       - name: Test Compiler Support
         run: |
