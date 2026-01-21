@@ -1552,14 +1552,15 @@ jobs:
       - name: Disable deprecated-non-prototype warning for Clang 19
         working-directory: amxmodx
         run: |
-          echo "=== Disabling -Wdeprecated-non-prototype warning ==="
+          echo "=== Disabling Clang 19 strict warnings ==="
           
-          # Add -Wno-deprecated-non-prototype right after -Werror (present in flags list)
-          sed -i "s/'-Werror',/'-Werror', '-Wno-deprecated-non-prototype',/" AMBuildScript
+          # Add -Wno-deprecated-non-prototype and -Wno-array-parameter right after -Werror
+          sed -i "s/'-Werror',/'-Werror', '-Wno-deprecated-non-prototype', '-Wno-array-parameter',/" AMBuildScript
           
           # Verify the change
           echo "=== Verifying change ==="
-          grep -n -- "-Wno-deprecated-non-prototype" AMBuildScript || echo "Pattern not found"
+          grep -n -- "-Wno-deprecated-non-prototype" AMBuildScript && echo "✓ deprecated-non-prototype disabled"
+          grep -n -- "-Wno-array-parameter" AMBuildScript && echo "✓ array-parameter disabled"
 
       - name: Build
         working-directory: amxmodx
