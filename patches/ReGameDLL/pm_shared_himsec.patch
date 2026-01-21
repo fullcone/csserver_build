@@ -1,18 +1,21 @@
 --- a/pm_shared/pm_shared.cpp
 +++ b/pm_shared/pm_shared.cpp
-@@ -12,6 +12,11 @@
+@@ -12,6 +12,14 @@
  playermove_t *pmove = nullptr;
  BOOL g_onladder = FALSE;
  
 +// ============================================================================
-+// Stamina fix: No longer needed - using pow compensation instead
++// Stamina fix: Client-Server sync accumulator
 +// ============================================================================
-+// static real_t g_stamina_penalty_accumulator[MAX_CLIENTS] = {0};
++// Purpose: Ensure server applies penalty at same frequency as original 100fps
++//          to match client prediction (client uses original hw.dll)
++// ============================================================================
++static real_t g_stamina_penalty_accumulator[MAX_CLIENTS] = {0};
 +
  #ifdef REGAMEDLL_API
  static CCSPlayer *pmoveplayer = nullptr;
  #endif
-@@ -1056,26 +1061,14 @@
+@@ -1056,26 +1064,14 @@
  
  	pmtrace_t trace;
  
@@ -47,72 +50,83 @@
  
  	// Copy movement amounts
  	fmove = pmove->cmd.forwardmove;
-@@ -1120,6 +1113,64 @@
+@@ -1120,6 +1116,75 @@
  		wishspeed = maxspeed;
  	}
  
 +	// ============================================================================
-+	// STAMINA PENALTY: Frame-rate compensated penalty (pow method)
++	// STAMINA PENALTY: Client-Server Prediction Sync
 +	// ============================================================================
-+	// Root cause of "forward push" feeling:
-+	//   - Previous implementation waited for accumulator >= 10ms
-+	//   - First 5 frames: no penalty, speed = 250
-+	//   - Frame 6: sudden penalty, speed = 187.5
-+	//   - Result: sudden speed change = "push" feeling
++	// Problem: Client uses original hw.dll which applies penalty every 10ms
++	//          If server uses pow() with actual frametime, predictions mismatch
 +	//
-+	// Solution: Apply penalty every frame with frame-rate compensation
-+	//   - Use pow(flRatio, flFrametimeRatio) to adjust penalty strength
-+	//   - 100fps: pow(0.75, 1.0) = 0.75 per frame
-+	//   - 600fps: pow(0.75, 0.166) ≈ 0.952 per frame
-+	//   - After 6 frames at 600fps: 0.952^6 ≈ 0.75 (same as 100fps!)
++	// Solution: Server also applies penalty every 10ms (like original 100fps)
++	//           Use accumulator to ensure correct frequency at any tickrate
 +	//
-+	// Why this is perfect:
-+	//   - Every frame applies penalty (no sudden changes)
-+	//   - Penalty strength adjusted by frame rate (all FPS identical)
-+	//   - No "forward push" feeling (smooth speed changes)
-+	//   - No sticky feet (correct penalty frequency)
-+	//   - Mathematically equivalent to original 100fps
++	// Why this works:
++	//   - Client (hw.dll): Applies penalty every 10ms
++	//   - Server (this code): Also applies penalty every 10ms
++	//   - Result: Identical calculations → no prediction correction → no "push"
 +	// ============================================================================
 +	if (pmove->fuser2 > 0.0)
 +	{
-+		// Calculate base penalty ratio (identical to original code)
-+		real_t flRatio = (100.0 - pmove->fuser2 * 0.001 * 19.0) * 0.01;
-+		
-+		// Frame-rate compensation: adjust penalty strength
-+		// Reference: 100fps = 10ms per frame
-+		real_t flReferenceFrametime = 0.01;  // 10ms
-+		float flFrametimeRatio = pmove->frametime / flReferenceFrametime;
-+		
-+		// Adjust penalty strength using pow
-+		// This ensures all FPS have identical cumulative effect
-+		flRatio = pow(flRatio, flFrametimeRatio);
-+		
-+#ifdef REGAMEDLL_ADD
-+		// Apply additional compensation if stamina_restore_rate > 0
-+		if (stamina_restore_rate.value > 0.0f)
-+		{
-+			real_t flReferenceFrametime2 = 1.0f / stamina_restore_rate.value;
-+			float flFrametimeRatio2 = pmove->frametime / flReferenceFrametime2;
-+			flRatio = pow(flRatio, flFrametimeRatio2);
-+		}
++		// Get player index for accumulator
++		int playerIndex = 0;
++#ifdef REGAMEDLL_API
++		if (pmoveplayer)
++			playerIndex = pmoveplayer->entindex() - 1;
 +#endif
 +		
-+		// Safety clamp
-+		if (flRatio < 0.0) flRatio = 0.0;
-+		if (flRatio > 1.0) flRatio = 1.0;
++		// Clamp to valid range
++		if (playerIndex < 0) playerIndex = 0;
++		if (playerIndex >= MAX_CLIENTS) playerIndex = MAX_CLIENTS - 1;
 +		
-+		// Apply penalty to current velocity
-+		pmove->velocity[0] *= flRatio;
-+		pmove->velocity[1] *= flRatio;
++		// Accumulate frametime
++		g_stamina_penalty_accumulator[playerIndex] += pmove->frametime;
 +		
-+		// Also apply to target speed (for consistency)
-+		wishspeed *= flRatio;
++		// Apply penalty every 10ms (matching original 100fps behavior)
++		const real_t PENALTY_INTERVAL = 0.01;  // 10ms
++		
++		if (g_stamina_penalty_accumulator[playerIndex] >= PENALTY_INTERVAL)
++		{
++			// Calculate how many 10ms intervals have passed
++			int numIntervals = (int)(g_stamina_penalty_accumulator[playerIndex] / PENALTY_INTERVAL);
++			g_stamina_penalty_accumulator[playerIndex] -= numIntervals * PENALTY_INTERVAL;
++			
++			// Apply penalty for each interval
++			for (int i = 0; i < numIntervals; i++)
++			{
++				// Calculate base penalty ratio (identical to original code)
++				real_t flRatio = (100.0 - pmove->fuser2 * 0.001 * 19.0) * 0.01;
++				
++#ifdef REGAMEDLL_ADD
++				// Apply additional compensation if stamina_restore_rate > 0
++				if (stamina_restore_rate.value > 0.0f)
++				{
++					real_t flReferenceFrametime2 = 1.0f / stamina_restore_rate.value;
++					float flFrametimeRatio2 = PENALTY_INTERVAL / flReferenceFrametime2;
++					flRatio = pow(flRatio, flFrametimeRatio2);
++				}
++#endif
++				
++				// Safety clamp
++				if (flRatio < 0.0) flRatio = 0.0;
++				if (flRatio > 1.0) flRatio = 1.0;
++				
++				// Apply penalty to current velocity
++				pmove->velocity[0] *= flRatio;
++				pmove->velocity[1] *= flRatio;
++				
++				// Also apply to target speed (for consistency)
++				wishspeed *= flRatio;
++			}
++		}
 +	}
 +
  	// Set pmove velocity
  	pmove->velocity[2] = 0;
  	PM_Accelerate(wishdir, wishspeed, pmove->movevars->accelerate);
-@@ -2388,7 +2439,10 @@
+@@ -2388,7 +2453,10 @@
  		return;
  	}
  
@@ -124,7 +138,7 @@
  
  	if (pmove->waterjumptime < 0 || !pmove->waterlevel)
  	{
-@@ -2644,7 +2698,10 @@
+@@ -2644,7 +2712,10 @@
  	// See if we are waterjumping.  If so, decrement count and return.
  	if (pmove->waterjumptime != 0.0f)
  	{
@@ -136,7 +150,7 @@
  
  		if (pmove->waterjumptime < 0)
  		{
-@@ -2804,6 +2861,13 @@
+@@ -2804,6 +2875,13 @@
  
  	pmove->fuser2 = 1315.789429;
  
@@ -150,7 +164,7 @@
  	// Decay it for simulation
  	PM_FixupGravityVelocity();
  
-@@ -3073,9 +3137,50 @@
+@@ -3073,9 +3151,50 @@
  
  void PM_ReduceTimers()
  {
@@ -202,7 +216,7 @@
  
  		if (pmove->flTimeStepSound < 0)
  		{
-@@ -3085,7 +3190,7 @@
+@@ -3085,7 +3204,7 @@
  
  	if (pmove->flDuckTime > 0)
  	{
@@ -211,7 +225,7 @@
  
  		if (pmove->flDuckTime < 0)
  		{
-@@ -3095,7 +3200,7 @@
+@@ -3095,7 +3214,7 @@
  
  	if (pmove->flSwimTime > 0)
  	{
@@ -220,7 +234,7 @@
  
  		if (pmove->flSwimTime < 0)
  		{
-@@ -3105,7 +3210,7 @@
+@@ -3105,7 +3224,7 @@
  
  	if (pmove->fuser2 > 0.0)
  	{
@@ -229,7 +243,7 @@
  
  		if (pmove->fuser2 < 0.0)
  		{
-@@ -3137,8 +3242,43 @@
+@@ -3137,8 +3256,43 @@
  
  	// # of msec to apply movement
  
