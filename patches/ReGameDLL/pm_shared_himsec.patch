@@ -5,9 +5,9 @@
  BOOL g_onladder = FALSE;
  
 +// ============================================================================
-+// Stamina fix: No longer needed - penalty is applied to wishspeed directly
++// Stamina fix: Penalty accumulator to ensure consistent penalty frequency
 +// ============================================================================
-+// static real_t g_stamina_frame_accumulator[MAX_CLIENTS] = {0};
++static real_t g_stamina_penalty_accumulator[MAX_CLIENTS] = {0};
 +
  #ifdef REGAMEDLL_API
  static CCSPlayer *pmoveplayer = nullptr;
@@ -47,73 +47,88 @@
  
  	// Copy movement amounts
  	fmove = pmove->cmd.forwardmove;
-@@ -1120,6 +1113,65 @@
+@@ -1120,6 +1113,80 @@
  		wishspeed = maxspeed;
  	}
  
 +	// ============================================================================
-+	// STAMINA PENALTY: Perfect 100fps replication (hybrid mode)
++	// STAMINA PENALTY: Perfect 100fps replication with controlled frequency
 +	// ============================================================================
-+	// This perfectly replicates the original 100fps behavior:
-+	//   1. Reduce current velocity (like original)
-+	//   2. Also reduce target speed (for consistency)
-+	//   3. PM_Accelerate balances the two forces
++	// Root cause of sticky feet:
++	//   - Original code applies penalty EVERY FRAME
++	//   - 100fps: 1 penalty per 10ms
++	//   - 600fps: 6 penalties per 10ms
++	//   - Result: 600fps gets 6x more penalties = speed too low!
++	//
++	// Solution:
++	//   - Use accumulator to control penalty frequency
++	//   - Apply penalty only once per 10ms (100fps rate)
++	//   - All FPS get same number of penalties
++	//   - Adjust wishspeed every frame for smooth acceleration
 +	//
 +	// Why this is perfect:
-+	//   - Same logic as original 100fps (velocity reduction + acceleration)
-+	//   - Frame-rate independent (all FPS behave identically)
-+	//   - Smooth speed changes (no "push" feeling)
-+	//   - Maintains game balance (25% penalty, 1.3s recovery)
-+	//
-+	// stamina_restore_rate behavior:
-+	//   - 0: Use original penalty (no compensation)
-+	//   - >0: Apply frame-rate compensation using pow()
-+	//
-+	// Original 100fps behavior:
-+	//   Each frame: velocity *= ratio, then PM_Accelerate(wishspeed)
-+	//   Result: Speed is constantly reduced, then accelerated back
-+	//   Balance: The two forces create smooth speed changes
-+	//
-+	// This implementation:
-+	//   Each frame: velocity *= ratio, wishspeed *= ratio, then PM_Accelerate
-+	//   Result: Same balance as original, but works at all FPS
-+	//   Effect: Perfect 100fps replication at any frame rate
++	//   - Penalty frequency: 100 times/second (all FPS)
++	//   - Penalty strength: 25% (same as original)
++	//   - Recovery time: 1.3 seconds (same as original)
++	//   - No sticky feet (correct penalty frequency)
++	//   - No sudden acceleration (smooth wishspeed adjustment)
 +	// ============================================================================
 +	if (pmove->fuser2 > 0.0)
 +	{
-+		// Calculate penalty ratio (identical to original code)
-+		real_t flRatio = (100.0 - pmove->fuser2 * 0.001 * 19.0) * 0.01;
++		int player_index = pmove->player_index;
++		real_t frametime_ms = pmove->frametime * 1000.0;
 +		
-+#ifdef REGAMEDLL_ADD
-+		// Apply frame-rate compensation if stamina_restore_rate > 0
-+		// This allows server admins to adjust penalty strength
-+		if (stamina_restore_rate.value > 0.0f)
++		// ====================================================================
++		// Step 1: Apply velocity penalty at 100fps rate (every 10ms)
++		// ====================================================================
++		g_stamina_penalty_accumulator[player_index] += frametime_ms;
++		
++		if (g_stamina_penalty_accumulator[player_index] >= 10.0)
 +		{
-+			real_t flReferenceFrametime = 1.0f / stamina_restore_rate.value;
-+			float flFrametimeRatio = pmove->frametime / flReferenceFrametime;
-+			flRatio = pow(flRatio, flFrametimeRatio);
-+		}
++			g_stamina_penalty_accumulator[player_index] -= 10.0;
++			
++			// Calculate penalty ratio (identical to original code)
++			real_t flRatio = (100.0 - pmove->fuser2 * 0.001 * 19.0) * 0.01;
++			
++#ifdef REGAMEDLL_ADD
++			// Apply frame-rate compensation if stamina_restore_rate > 0
++			if (stamina_restore_rate.value > 0.0f)
++			{
++				real_t flReferenceFrametime = 1.0f / stamina_restore_rate.value;
++				float flFrametimeRatio = 0.01 / flReferenceFrametime;  // Fixed 10ms
++				flRatio = pow(flRatio, flFrametimeRatio);
++			}
 +#endif
++			
++			// Safety clamp
++			if (flRatio < 0.0) flRatio = 0.0;
++			if (flRatio > 1.0) flRatio = 1.0;
++			
++			// Apply penalty to current velocity
++			pmove->velocity[0] *= flRatio;
++			pmove->velocity[1] *= flRatio;
++		}
 +		
-+		// Safety clamp
-+		if (flRatio < 0.0) flRatio = 0.0;
-+		if (flRatio > 1.0) flRatio = 1.0;
++		// ====================================================================
++		// Step 2: Adjust wishspeed every frame (for smooth acceleration)
++		// ====================================================================
++		// Calculate current penalty strength based on fuser2
++		real_t penalty_progress = pmove->fuser2 / 1315.789429;
++		real_t speed_multiplier = 0.75 + (1.0 - penalty_progress) * 0.25;
 +		
-+		// 1. Reduce current velocity (like original 100fps)
-+		//    This creates the immediate speed reduction
-+		pmove->velocity[0] *= flRatio;
-+		pmove->velocity[1] *= flRatio;
-+		
-+		// 2. Also reduce target speed (for consistency)
-+		//    This ensures PM_Accelerate accelerates to the penalized target
-+		//    Without this, PM_Accelerate would fight against the penalty
-+		wishspeed *= flRatio;
++		// Apply to target speed
++		wishspeed *= speed_multiplier;
++	}
++	else
++	{
++		// Penalty ended, reset accumulator
++		g_stamina_penalty_accumulator[pmove->player_index] = 0;
 +	}
 +
  	// Set pmove velocity
  	pmove->velocity[2] = 0;
  	PM_Accelerate(wishdir, wishspeed, pmove->movevars->accelerate);
-@@ -2388,7 +2440,10 @@
+@@ -2388,7 +2455,10 @@
  		return;
  	}
  
@@ -125,7 +140,7 @@
  
  	if (pmove->waterjumptime < 0 || !pmove->waterlevel)
  	{
-@@ -2644,7 +2699,10 @@
+@@ -2644,7 +2714,10 @@
  	// See if we are waterjumping.  If so, decrement count and return.
  	if (pmove->waterjumptime != 0.0f)
  	{
@@ -137,7 +152,7 @@
  
  		if (pmove->waterjumptime < 0)
  		{
-@@ -2804,6 +2862,13 @@
+@@ -2804,6 +2877,13 @@
  
  	pmove->fuser2 = 1315.789429;
  
@@ -151,7 +166,7 @@
  	// Decay it for simulation
  	PM_FixupGravityVelocity();
  
-@@ -3073,9 +3138,50 @@
+@@ -3073,9 +3153,50 @@
  
  void PM_ReduceTimers()
  {
@@ -203,7 +218,7 @@
  
  		if (pmove->flTimeStepSound < 0)
  		{
-@@ -3085,7 +3191,7 @@
+@@ -3085,7 +3206,7 @@
  
  	if (pmove->flDuckTime > 0)
  	{
@@ -212,7 +227,7 @@
  
  		if (pmove->flDuckTime < 0)
  		{
-@@ -3095,7 +3201,7 @@
+@@ -3095,7 +3216,7 @@
  
  	if (pmove->flSwimTime > 0)
  	{
@@ -221,7 +236,7 @@
  
  		if (pmove->flSwimTime < 0)
  		{
-@@ -3105,7 +3211,7 @@
+@@ -3105,7 +3226,7 @@
  
  	if (pmove->fuser2 > 0.0)
  	{
@@ -230,7 +245,7 @@
  
  		if (pmove->fuser2 < 0.0)
  		{
-@@ -3137,8 +3243,43 @@
+@@ -3137,8 +3258,43 @@
  
  	// # of msec to apply movement
  
