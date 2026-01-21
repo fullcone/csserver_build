@@ -1,0 +1,1863 @@
+name: C/C++ CI
+
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - '**.md'
+      - '.github/**'
+  pull_request:
+    types: [opened, reopened, synchronize]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+env:
+  # Release tag format: build-YYYYMMDD-RUN_NUMBER
+  RELEASE_TAG: build-${{ github.run_number }}
+
+jobs:
+  # Clean Docker environment before build
+  cleanup-docker:
+    name: 'Cleanup Docker Environment'
+    runs-on: self-hosted
+    # 不使用 container，直接在 runner 主机上运行
+    steps:
+      - name: Stop all containers
+        run: docker stop $(docker ps -aq) 2>/dev/null || true
+        continue-on-error: true
+
+      - name: Remove all containers
+        run: docker rm -f $(docker ps -aq) 2>/dev/null || true
+        continue-on-error: true
+
+      - name: Remove all images
+        run: docker rmi -f $(docker images -aq) 2>/dev/null || true
+        continue-on-error: true
+
+      - name: Prune Docker system
+        run: docker system prune -af --volumes
+        continue-on-error: true
+
+      - name: Clean workspace
+        run: |
+          rm -rf $GITHUB_WORKSPACE/* 2>/dev/null || true
+          rm -rf $GITHUB_WORKSPACE/.* 2>/dev/null || true
+        continue-on-error: true
+
+      - name: Restart Docker service
+        run: |
+          if command -v systemctl >/dev/null 2>&1; then
+            sudo systemctl restart docker
+          elif command -v service >/dev/null 2>&1; then
+            sudo service docker restart
+          else
+            echo "Cannot restart Docker service automatically"
+          fi
+        continue-on-error: true
+
+      - name: Wait for Docker to be ready
+        run: |
+          for i in {1..30}; do
+            if docker info >/dev/null 2>&1; then
+              echo "Docker is ready"
+              exit 0
+            fi
+            echo "Waiting for Docker... ($i/30)"
+            sleep 2
+          done
+          echo "Docker failed to start"
+          exit 1
+
+  # Create Release first, all subsequent jobs upload to this Release
+  create-release:
+    name: 'Create Release'
+    runs-on: self-hosted
+    needs: cleanup-docker  # 等待清理完成
+    container: debian:13-slim
+    outputs:
+      release_id: ${{ steps.create.outputs.release_id }}
+      upload_url: ${{ steps.create.outputs.upload_url }}
+      release_tag: ${{ steps.create.outputs.release_tag }}
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y curl jq ca-certificates
+
+      - name: Create Release on fullcone/gar
+        id: create
+        env:
+          GAR_REPO_TOKEN: ${{ secrets.GAR_REPO_TOKEN }}
+        shell: bash
+        run: |
+          RELEASE_TAG="build-$(date +%Y%m%d)-${{ github.run_number }}"
+          RELEASE_NAME="CS Server Build #${{ github.run_number }}"
+          RELEASE_BODY="Auto build in progress...
+          
+          Build Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          Run ID: ${{ github.run_id }}
+          Status: Building components..."
+          
+          # 使用 jq 构建安全的 JSON payload
+          JSON_PAYLOAD=$(jq -n \
+            --arg tag "$RELEASE_TAG" \
+            --arg name "$RELEASE_NAME" \
+            --arg body "$RELEASE_BODY" \
+            '{tag_name: $tag, name: $name, body: $body, draft: true, prerelease: false}')
+          
+          # 带重试创建 Release
+          for i in 1 2 3; do
+            RELEASE_RESPONSE=$(curl -s -f -X POST \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/fullcone/gar/releases" \
+              -d "$JSON_PAYLOAD") && break
+            echo "Create release retry $i..."
+            sleep 5
+          done
+          
+          RELEASE_ID=$(echo "$RELEASE_RESPONSE" | jq -r '.id')
+          UPLOAD_URL=$(echo "$RELEASE_RESPONSE" | jq -r '.upload_url' | sed 's/{?name,label}//')
+          
+          if [ "$RELEASE_ID" = "null" ] || [ -z "$RELEASE_ID" ]; then
+            echo "Failed to create release:"
+            echo "$RELEASE_RESPONSE"
+            exit 1
+          fi
+          
+          echo "release_id=$RELEASE_ID" >> $GITHUB_OUTPUT
+          echo "upload_url=$UPLOAD_URL" >> $GITHUB_OUTPUT
+          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+          echo "Created draft release: $RELEASE_TAG (ID: $RELEASE_ID)"
+
+  rehlds:
+    name: 'ReHLDS Linux'
+    runs-on: ubuntu-latest
+    needs: create-release
+    container: debian:13-slim
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Install dependencies
+        run: |
+          dpkg --add-architecture i386
+          apt-get update
+          for i in 1 2 3; do
+            apt-get install -y \
+              gcc-multilib g++-multilib \
+              build-essential \
+              libc6-dev libc6-dev-i386 \
+              git cmake rsync curl unzip jq \
+              zlib1g-dev zlib1g-dev:i386 \
+              perl p7zip-full \
+              g++ gcc \
+              libssl-dev libssl-dev:i386 \
+              pkg-config ca-certificates && break
+            echo "Retry $i..."
+            sleep 5
+            apt-get update
+          done
+
+      - name: Configure
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Use ALLINONE ReHLDS (no cloning needed)
+        run: |
+          echo "=== Using pre-patched ReHLDS from ALLINONE directory ==="
+          # 复制 ALLINONE/rehlds 到工作目录（不包括 .git，已在推送时移除）
+          cp -r ALLINONE/rehlds/* .
+          # 复制隐藏文件（如 .editorconfig, .gitignore 等，但不包括 .git）
+          find ALLINONE/rehlds -maxdepth 1 -name ".*" ! -name ".git" -exec cp -r {} . \;
+          
+          echo "ReHLDS source from ALLINONE (already patched)"
+          ls -la
+
+      - name: Download cJSON
+        run: |
+          # 获取最新版本（带重试）
+          for i in 1 2 3; do
+            CJSON_VERSION=$(curl -sf https://api.github.com/repos/DaveGamble/cJSON/releases/latest | grep -oP '"tag_name": "v\K[^"]+')
+            [ -n "$CJSON_VERSION" ] && break
+            echo "API retry $i/3..."
+            sleep 5
+          done
+          
+          if [ -z "$CJSON_VERSION" ]; then
+            echo "ERROR: Failed to get cJSON version from GitHub API"
+            exit 1
+          fi
+          
+          echo "CJSON_VERSION=${CJSON_VERSION}" >> $GITHUB_ENV
+          echo "Downloading cJSON v${CJSON_VERSION}"
+          
+          # 下载（带重试）
+          DOWNLOAD_SUCCESS=false
+          for i in 1 2 3; do
+            rm -f cjson.zip
+            if curl -fSL "https://github.com/DaveGamble/cJSON/archive/refs/tags/v${CJSON_VERSION}.zip" -o cjson.zip && [ -f cjson.zip ] && [ -s cjson.zip ]; then
+              DOWNLOAD_SUCCESS=true
+              break
+            fi
+            echo "Download retry $i/3..."
+            sleep 5
+          done
+          
+          if [ "$DOWNLOAD_SUCCESS" != "true" ]; then
+            echo "ERROR: Failed to download cJSON after 3 retries"
+            exit 1
+          fi
+          
+          unzip -q cjson.zip
+          mkdir -p rehlds/engine/cjson
+          cp cJSON-${CJSON_VERSION}/cJSON.h rehlds/engine/cjson/
+          cp cJSON-${CJSON_VERSION}/cJSON.c rehlds/engine/cjson/
+          # Keep original files for archiving
+          mkdir -p deps-archive
+          mv cjson.zip deps-archive/
+          mv cJSON-${CJSON_VERSION} deps-archive/
+
+      - name: Build OpenSSL (32-bit static)
+        run: |
+          # 获取最新版本（带重试）
+          for i in 1 2 3; do
+            OPENSSL_VERSION=$(curl -sf https://api.github.com/repos/openssl/openssl/releases/latest | grep -oP '"tag_name": "openssl-\K[^"]+')
+            [ -n "$OPENSSL_VERSION" ] && break
+            echo "API retry $i/3..."
+            sleep 5
+          done
+          
+          if [ -z "$OPENSSL_VERSION" ]; then
+            echo "ERROR: Failed to get OpenSSL version from GitHub API"
+            exit 1
+          fi
+          
+          echo "OPENSSL_VERSION=${OPENSSL_VERSION}" >> $GITHUB_ENV
+          echo "Building OpenSSL v${OPENSSL_VERSION} (32-bit static)"
+          
+          # 下载（带重试）
+          DOWNLOAD_SUCCESS=false
+          for i in 1 2 3; do
+            rm -f openssl.tar.gz
+            if curl -fSL "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" -o openssl.tar.gz && [ -f openssl.tar.gz ] && [ -s openssl.tar.gz ]; then
+              DOWNLOAD_SUCCESS=true
+              break
+            fi
+            echo "Download retry $i/3..."
+            sleep 5
+          done
+          
+          if [ "$DOWNLOAD_SUCCESS" != "true" ]; then
+            echo "ERROR: Failed to download OpenSSL after 3 retries"
+            exit 1
+          fi
+          
+          tar xzf openssl.tar.gz
+          cd openssl-${OPENSSL_VERSION}
+          ./Configure linux-x86 no-shared no-async no-tests --prefix=$PWD/../openssl_install --openssldir=$PWD/../openssl_install -static
+          make -j$(nproc)
+          make install_sw
+          cd ..
+          # Keep original files for archiving
+          mv openssl.tar.gz deps-archive/
+          mv openssl-${OPENSSL_VERSION} deps-archive/
+
+      - name: Download and build libcurl (32-bit static)
+        run: |
+          # 获取最新版本（带重试）
+          for i in 1 2 3; do
+            CURL_TAG=$(curl -sf https://api.github.com/repos/curl/curl/releases/latest | grep '"tag_name"' | sed 's/.*"tag_name": "curl-\([^"]*\)".*/\1/')
+            [ -n "$CURL_TAG" ] && break
+            echo "API retry $i/3..."
+            sleep 5
+          done
+          
+          if [ -z "$CURL_TAG" ]; then
+            echo "ERROR: Failed to get curl version from GitHub API"
+            exit 1
+          fi
+          
+          CURL_VERSION=$(echo "$CURL_TAG" | tr '_' '.')
+          echo "CURL_VERSION=${CURL_VERSION}" >> $GITHUB_ENV
+          echo "Building libcurl v${CURL_VERSION} (32-bit static)"
+          
+          # 下载（带重试）
+          DOWNLOAD_SUCCESS=false
+          for i in 1 2 3; do
+            rm -f curl.tar.gz
+            if curl -fSL "https://curl.se/download/curl-${CURL_VERSION}.tar.gz" -o curl.tar.gz && [ -f curl.tar.gz ] && [ -s curl.tar.gz ]; then
+              DOWNLOAD_SUCCESS=true
+              break
+            fi
+            echo "Download retry $i/3..."
+            sleep 5
+          done
+          
+          if [ "$DOWNLOAD_SUCCESS" != "true" ]; then
+            echo "ERROR: Failed to download curl after 3 retries"
+            exit 1
+          fi
+          
+          tar xzf curl.tar.gz
+          mkdir -p rehlds/engine/curl
+          cp curl-${CURL_VERSION}/include/curl/*.h rehlds/engine/curl/
+          cd curl-${CURL_VERSION}
+          OPENSSL_LIB_DIR="$PWD/../openssl_install/lib"
+          [ -d "$PWD/../openssl_install/lib64" ] && OPENSSL_LIB_DIR="$PWD/../openssl_install/lib64"
+          ./configure --enable-static --disable-shared --disable-ldap --disable-ldaps --disable-rtsp --disable-dict --disable-telnet --disable-tftp --disable-pop3 --disable-imap --disable-smb --disable-smtp --disable-gopher --disable-mqtt --disable-manual --disable-docs --without-librtmp --without-libidn2 --without-libpsl --with-openssl=$PWD/../openssl_install --with-zlib CFLAGS="-m32 -O2" LDFLAGS="-m32 -L${OPENSSL_LIB_DIR}" CPPFLAGS="-I$PWD/../openssl_install/include" PKG_CONFIG_PATH="$PWD/../openssl_install/lib/pkgconfig:$PWD/../openssl_install/lib64/pkgconfig" --host=i686-linux-gnu
+          make -j$(nproc)
+          mkdir -p ../curl_install/lib
+          cp lib/.libs/libcurl.a ../curl_install/lib/
+          cd ..
+          # Keep original files for archiving
+          mv curl.tar.gz deps-archive/
+          mv curl-${CURL_VERSION} deps-archive/
+
+
+
+      - name: Install Rust toolchain for RemoteAgent
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          . "$HOME/.cargo/env"
+          rustup target add i686-unknown-linux-gnu
+          # 安装 32 位交叉编译工具链
+          apt-get install -y gcc-i686-linux-gnu
+          echo "Rust installed: $(rustc --version)"
+
+      - name: Build RemoteAgent (32-bit .so)
+        run: |
+          . "$HOME/.cargo/env"
+          cd remote_agent
+          # 使用 vendored openssl，避免交叉编译依赖问题
+          # 设置交叉编译器
+          export CC_i686_unknown_linux_gnu=i686-linux-gnu-gcc
+          export CXX_i686_unknown_linux_gnu=i686-linux-gnu-g++
+          export AR_i686_unknown_linux_gnu=i686-linux-gnu-ar
+          export CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER=i686-linux-gnu-gcc
+          cargo build --release --target i686-unknown-linux-gnu
+          ls -la target/i686-unknown-linux-gnu/release/
+          echo "RemoteAgent built successfully"
+
+      - name: Archive patched source code
+        run: |
+          mkdir -p source-archive
+          echo "=== Archiving source code ===" 
+          tar -czf source-archive/rehlds-source.tar.gz \
+              rehlds dep remote_agent .git 2>/dev/null || true
+          echo "ReHLDS source (from ALLINONE, pre-patched) archived at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > source-archive/rehlds-info.txt
+          echo "Commit: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> source-archive/rehlds-info.txt
+          echo "Branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')" >> source-archive/rehlds-info.txt
+          echo "" >> source-archive/rehlds-info.txt
+          echo "=== Applied Patches (in ALLINONE) ===" >> source-archive/rehlds-info.txt
+          echo "1. PlayerReporter - Player connection/disconnection reporting via HTTP" >> source-archive/rehlds-info.txt
+          echo "2. NoMaster - Disable master server communication by default" >> source-archive/rehlds-info.txt
+          echo "3. VAC Disabled - VAC disabled by default" >> source-archive/rehlds-info.txt
+          echo "4. RemoteAgent - Remote monitoring and control agent" >> source-archive/rehlds-info.txt
+
+      - name: Test Compiler Support
+        run: |
+          echo "=== Testing Compiler Options Support ==="
+          chmod +x test_compiler_support.sh
+          ./test_compiler_support.sh
+        shell: bash
+
+      - name: Build and Run unittests
+        run: |
+          # Note: bundled librt.so already renamed to librt.so.old in ALLINONE
+          # System will use its own librt.so which is compatible with GLIBC 2.41
+          
+          rm -rf build && cmake -DCMAKE_BUILD_TYPE=Unittests -B build && cmake --build build -j$(nproc)
+          retVal=0
+          export LD_LIBRARY_PATH="rehlds/lib/linux32:$LD_LIBRARY_PATH"
+          ./build/rehlds/engine_i486 2> /dev/null > result.log || retVal=$?
+          cat result.log
+          if [ $retVal -ne 0 ] && [ $retVal -ne 3 ]; then
+            exit 1
+          fi
+        shell: bash
+
+      - name: Build using GCC Compiler
+        run: |
+          rm -rf build && cmake -B build && cmake --build build -j$(nproc)
+
+      - name: Verify Compiler Optimizations
+        run: |
+          echo "=== Compiler Optimization Verification ==="
+          echo ""
+          echo "GCC Version: $(gcc --version | head -1)"
+          echo ""
+          
+          # Make script executable
+          chmod +x ./verify_optimizations.sh
+          
+          # Verify main engine binary
+          ./verify_optimizations.sh build/rehlds/engine_i486.so "ReHLDS Engine"
+          
+          # Verify HLTV binaries
+          ./verify_optimizations.sh build/rehlds/HLTV/Core/core.so "HLTV Core"
+          
+          echo "=== All Optimizations Verified ==="
+        shell: bash
+
+      - name: Move files
+        run: |
+          mkdir -p publish/valve/dlls
+          mv build/rehlds/engine_i486.so publish/engine_i486.so
+          mv rehlds/version/appversion.h publish/appversion.h
+          mv build/rehlds/dedicated/hlds_linux publish/hlds_linux
+          mv build/rehlds/HLTV/Console/hltv publish/hltv
+          mv build/rehlds/HLTV/Core/core.so publish/core.so
+          mv build/rehlds/HLTV/Proxy/proxy.so publish/proxy.so
+          mv build/rehlds/HLTV/DemoPlayer/demoplayer.so publish/demoplayer.so
+          mv build/rehlds/HLTV/Director/director.so publish/valve/dlls/director.so
+          mv build/rehlds/filesystem/FileSystem_Stdio/filesystem_stdio.so publish/filesystem_stdio.so
+          cp rehlds/lib/linux32/libsteam_api.so publish/libsteam_api.so
+          cp rehlds/lib/linux32/libm.so publish/libm.so
+          # DO NOT copy librt.so - use system version to avoid GLIBC_PRIVATE symbol errors
+          # The bundled librt.so was compiled with old GLIBC and references private symbols
+          # that don't exist in modern GLIBC (2.41+). System librt.so is compatible.
+          # cp rehlds/lib/linux32/librt.so publish/librt.so
+          # Copy RemoteAgent .so (optional component)
+          if [ -f remote_agent/target/i686-unknown-linux-gnu/release/libremote_agent.so ]; then
+            cp remote_agent/target/i686-unknown-linux-gnu/release/libremote_agent.so publish/remote_agent.so
+            echo "RemoteAgent copied to publish/"
+          fi
+
+      - name: Run GLIBC/ABI version compat test
+        run: |
+          # Debian 13 uses GLIBC 2.41 and GLIBCXX 3.4.32 (GCC 14), update thresholds
+          sed -i 's/threshold_version\[GLIBC\]="2.11"/threshold_version[GLIBC]="2.41"/g' ./rehlds/version/glibc_test.sh
+          sed -i 's/threshold_version\[GLIBCXX\]="3.4.15"/threshold_version[GLIBCXX]="3.4.32"/g' ./rehlds/version/glibc_test.sh
+          
+          # Show actual versions used
+          echo "=== Checking actual GLIBC/GLIBCXX versions ==="
+          for binary in publish/engine_i486.so publish/hlds_linux; do
+            echo "Binary: $binary"
+            objdump -T "$binary" | grep -E "GLIBC_|GLIBCXX_" | sed 's/.*\(GLIBC[CX]*_[0-9.]*\).*/\1/' | sort -u | tail -3
+          done
+          
+          # Test core binaries
+          bash ./rehlds/version/glibc_test.sh publish/engine_i486.so publish/hlds_linux publish/hltv publish/core.so publish/proxy.so publish/demoplayer.so publish/valve/dlls/director.so publish/filesystem_stdio.so
+          # Test RemoteAgent if exists (it may have different GLIBC requirements due to Rust)
+          if [ -f publish/remote_agent.so ]; then
+            echo "=== RemoteAgent GLIBC check ==="
+            bash ./rehlds/version/glibc_test.sh publish/remote_agent.so || echo "Warning: RemoteAgent may have higher GLIBC requirements"
+          fi
+        shell: bash
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=$(grep -oP 'APP_VERSION_STRD\s+"\K[^"]+' publish/appversion.h || echo "unknown")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Upload to Release
+        env:
+          GAR_REPO_TOKEN: ${{ secrets.GAR_REPO_TOKEN }}
+          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
+        run: |
+          # Add dependencies to source archive
+          if [ -d deps-archive ]; then
+            # Record dependency versions
+            echo "" >> source-archive/rehlds-info.txt
+            echo "=== Dependencies ===" >> source-archive/rehlds-info.txt
+            echo "cJSON: ${CJSON_VERSION:-unknown}" >> source-archive/rehlds-info.txt
+            echo "OpenSSL: ${OPENSSL_VERSION:-unknown}" >> source-archive/rehlds-info.txt
+            echo "curl: ${CURL_VERSION:-unknown}" >> source-archive/rehlds-info.txt
+            # Package dependencies
+            tar -czf source-archive/rehlds-deps.tar.gz deps-archive/
+          fi
+          
+          cd publish && 7z a -t7z -p"${ZIP_PASSWORD}" -mhe=on ../rehlds.7z * || true
+          cd ..
+          
+          # Fix: Create rehlds-source.7z from source-archive directory content
+          if [ -d source-archive ]; then
+            cd source-archive && 7z a -t7z -p"${ZIP_PASSWORD}" -mhe=on ../rehlds-source.7z * || true
+            cd ..
+          else
+             echo "Error: source-archive directory not found"
+             ls -la
+             exit 1
+          fi
+          
+          # 上传 rehlds.7z（带重试）
+          UPLOAD_SUCCESS=false
+          for i in 1 2 3; do
+            if curl -s -f -X POST \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Content-Type: application/x-7z-compressed" \
+              "${{ needs.create-release.outputs.upload_url }}?name=rehlds.7z" \
+              --data-binary @rehlds.7z; then
+              UPLOAD_SUCCESS=true
+              break
+            fi
+            echo "Upload rehlds.7z retry $i..."
+            sleep 5
+          done
+          
+          if [ "$UPLOAD_SUCCESS" != "true" ]; then
+            echo "ERROR: Failed to upload rehlds.7z after 3 retries"
+            exit 1
+          fi
+          
+          # 上传 rehlds-source.7z（带重试）
+          UPLOAD_SUCCESS=false
+          for i in 1 2 3; do
+            if curl -s -f -X POST \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Content-Type: application/x-7z-compressed" \
+              "${{ needs.create-release.outputs.upload_url }}?name=rehlds-source.7z" \
+              --data-binary @rehlds-source.7z; then
+              UPLOAD_SUCCESS=true
+              break
+            fi
+            echo "Upload rehlds-source.7z retry $i..."
+            sleep 5
+          done
+          
+          if [ "$UPLOAD_SUCCESS" != "true" ]; then
+            echo "ERROR: Failed to upload rehlds-source.7z after 3 retries"
+            exit 1
+          fi
+          
+          echo "Uploaded rehlds.7z and rehlds-source.7z (encrypted)"
+
+  regamedll:
+    name: 'ReGameDLL_CS Linux'
+    runs-on: ubuntu-latest
+    needs: create-release
+    container: debian:13-slim
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Install dependencies
+        run: |
+          dpkg --add-architecture i386
+          apt-get update
+          for i in 1 2 3; do
+            apt-get install -y \
+              gcc-multilib g++-multilib \
+              build-essential \
+              libc6-dev libc6-dev-i386 \
+              git cmake rsync curl jq p7zip-full \
+              g++ gcc && break
+            echo "Retry $i..."
+            sleep 5
+            apt-get update
+          done
+
+      - name: Configure
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone ReGameDLL_CS
+        run: |
+          git clone --recursive https://github.com/rehlds/ReGameDLL_CS.git regamedll-src
+          cp -r regamedll-src/* .
+          cp -r regamedll-src/.git .
+          rm -rf regamedll-src
+
+      - name: Archive original source code
+        run: |
+          mkdir -p source-archive
+          tar -czf source-archive/regamedll-source.tar.gz \
+              regamedll dep dist .git 2>/dev/null || true
+          echo "ReGameDLL_CS source archived at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > source-archive/regamedll-info.txt
+          echo "Commit: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> source-archive/regamedll-info.txt
+          echo "Branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')" >> source-archive/regamedll-info.txt
+
+      - name: Patch CMakeLists.txt for noexecstack
+        run: |
+          awk '
+            /version_script.lds/ { found=1 }
+            found && /^endif\(\)$/ {
+              print
+              print ""
+              print "# Disable executable stack for new Linux kernel security"
+              print "set(LINK_FLAGS \"${LINK_FLAGS} -Wl,-z,noexecstack\")"
+              found=0
+              next
+            }
+            { print }
+          ' regamedll/CMakeLists.txt > regamedll/CMakeLists.txt.tmp && mv regamedll/CMakeLists.txt.tmp regamedll/CMakeLists.txt
+
+      - name: Apply dead player see enemy equipment patch
+        run: |
+          sed -i '/#ifdef REGAMEDLL_FIXES/{
+            N
+            /TODO: Remove these fixes when they are implemented on the client side/{
+              s/#ifdef REGAMEDLL_FIXES/#if 0 \/\/ DISABLED: Allow dead players to see enemy C4\/defuser/
+            }
+          }' regamedll/dlls/player.cpp
+
+      - name: Test Compiler Support
+        run: |
+          echo "=== Testing Compiler Options Support (ReGameDLL) ==="
+          chmod +x ./test_compiler_support.sh
+          ./test_compiler_support.sh
+        shell: bash
+
+      - name: Build and Run unittests
+        run: |
+          rm -rf build && CC=gcc CXX=g++ cmake -DCMAKE_BUILD_TYPE=Unittests -B build && cmake --build build -j$(nproc)
+          retVal=0
+          ./build/regamedll/cs 2> /dev/null > result.log || retVal=$?
+          cat result.log
+          if [ $retVal -ne 0 ] && [ $retVal -ne 3 ]; then
+            exit 1
+          fi
+        shell: bash
+
+      - name: Build using GCC Compiler
+        run: |
+          rm -rf build && CC=gcc CXX=g++ cmake -B build && cmake --build build -j$(nproc)
+
+      - name: Verify Compiler Optimizations
+        run: |
+          echo "=== Compiler Optimization Verification (ReGameDLL) ==="
+          echo "GCC Version: $(gcc --version | head -1)"
+          echo ""
+          chmod +x ./verify_optimizations.sh
+          ./verify_optimizations.sh build/regamedll/cs.so "ReGameDLL"
+          echo "=== Verification Complete ==="
+        shell: bash
+
+      - name: Move files
+        run: |
+          mkdir -p publish/cstrike/dlls
+          mv build/regamedll/cs.so publish/cstrike/dlls/cs.so 2>/dev/null || true
+          cp regamedll/version/appversion.h publish/appversion.h
+          rsync -a dist/ publish/cstrike/ 2>/dev/null || true
+
+      - name: Run GLIBC/ABI version compat test
+        run: |
+          # Debian 13 uses GLIBC 2.41 and GLIBCXX 3.4.32 (GCC 14), update thresholds
+          sed -i 's/threshold_version\[GLIBC\]="2.11"/threshold_version[GLIBC]="2.41"/g' ./regamedll/version/glibc_test.sh
+          sed -i 's/threshold_version\[GLIBCXX\]="3.4.15"/threshold_version[GLIBCXX]="3.4.32"/g' ./regamedll/version/glibc_test.sh
+          bash ./regamedll/version/glibc_test.sh publish/cstrike/dlls/cs.so || echo "Warning: GLIBC version check failed, but continuing..."
+        shell: bash
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=$(grep -oP 'APP_VERSION_STRD\s+"\K[^"]+' publish/appversion.h || echo "unknown")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Upload to Release
+        env:
+          GAR_REPO_TOKEN: ${{ secrets.GAR_REPO_TOKEN }}
+          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
+        run: |
+          cd publish && 7z a -t7z -p"${ZIP_PASSWORD}" -mhe=on ../regamedll.7z * || true
+          cd ..
+          
+          # Fix: Create regamedll-source.7z from source-archive directory content
+          if [ -d source-archive ]; then
+            cd source-archive && 7z a -t7z -p"${ZIP_PASSWORD}" -mhe=on ../regamedll-source.7z * || true
+            cd ..
+          else
+             echo "Error: source-archive directory not found"
+             ls -la
+             exit 1
+          fi
+          
+          # 上传 regamedll.7z（带重试）
+          UPLOAD_SUCCESS=false
+          for i in 1 2 3; do
+            if curl -s -f -X POST \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Content-Type: application/x-7z-compressed" \
+              "${{ needs.create-release.outputs.upload_url }}?name=regamedll.7z" \
+              --data-binary @regamedll.7z; then
+              UPLOAD_SUCCESS=true
+              break
+            fi
+            echo "Upload regamedll.7z retry $i..."
+            sleep 5
+          done
+          
+          if [ "$UPLOAD_SUCCESS" != "true" ]; then
+            echo "ERROR: Failed to upload regamedll.7z after 3 retries"
+            exit 1
+          fi
+          
+          # 上传 regamedll-source.7z（带重试）
+          UPLOAD_SUCCESS=false
+          for i in 1 2 3; do
+            if curl -s -f -X POST \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Content-Type: application/x-7z-compressed" \
+              "${{ needs.create-release.outputs.upload_url }}?name=regamedll-source.7z" \
+              --data-binary @regamedll-source.7z; then
+              UPLOAD_SUCCESS=true
+              break
+            fi
+            echo "Upload regamedll-source.7z retry $i..."
+            sleep 5
+          done
+          
+          if [ "$UPLOAD_SUCCESS" != "true" ]; then
+            echo "ERROR: Failed to upload regamedll-source.7z after 3 retries"
+            exit 1
+          fi
+
+  metamod:
+    name: 'Metamod-R Linux'
+    runs-on: ubuntu-latest
+    needs: create-release
+    container: debian:13-slim
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Install dependencies
+        run: |
+          dpkg --add-architecture i386
+          apt-get update
+          for i in 1 2 3; do
+            apt-get install -y \
+              gcc-multilib g++-multilib \
+              build-essential \
+              libc6-dev libc6-dev-i386 \
+              git cmake rsync curl jq p7zip-full \
+              g++ gcc && break
+            echo "Retry $i..."
+            sleep 5
+            apt-get update
+          done
+
+      - name: Configure
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone Metamod-R
+        run: |
+          git clone --recursive https://github.com/rehlds/Metamod-R.git metamod-src
+          cp -r metamod-src/* .
+          cp -r metamod-src/.git .
+          rm -rf metamod-src
+
+      - name: Archive original source code
+        run: |
+          mkdir -p source-archive
+          tar -czf source-archive/metamod-source.tar.gz \
+              metamod .git 2>/dev/null || true
+          echo "Metamod-R source archived at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > source-archive/metamod-info.txt
+          echo "Commit: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> source-archive/metamod-info.txt
+          echo "Branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')" >> source-archive/metamod-info.txt
+
+      - name: Test Compiler Support
+        run: |
+          echo "=== Testing Compiler Options Support (Metamod) ==="
+          chmod +x ./test_compiler_support.sh
+          ./test_compiler_support.sh
+        shell: bash
+
+      - name: Build using GCC Compiler
+        run: |
+          rm -rf build && cmake -DCMAKE_BUILD_TYPE=COMPAT_GLIBC -B build && cmake --build build -j$(nproc)
+
+      - name: Verify Compiler Optimizations
+        run: |
+          echo "=== Compiler Optimization Verification (Metamod) ==="
+          echo "GCC Version: $(gcc --version | head -1)"
+          echo ""
+          chmod +x ./verify_optimizations.sh
+          ./verify_optimizations.sh build/metamod/metamod_i386.so "Metamod-R"
+          echo "=== Verification Complete ==="
+        shell: bash
+
+      - name: Prepare config
+        run: |
+          mkdir -p publish/cstrike/addons/metamod
+          rsync metamod/extra/config.ini publish/cstrike/addons/metamod
+          rsync metamod/extra/plugins.ini publish/cstrike/addons/metamod
+
+      - name: Move files
+        run: |
+          mv build/metamod/metamod_i386.so publish/cstrike/addons/metamod/metamod_i386.so
+          cp metamod/version/appversion.h publish/appversion.h
+
+      - name: Run GLIBC/ABI version compat test
+        run: |
+          # Debian 13 uses GLIBC 2.41 and GLIBCXX 3.4.32 (GCC 14), update thresholds
+          sed -i 's/threshold_version\[GLIBC\]="2.11"/threshold_version[GLIBC]="2.41"/g' ./metamod/version/glibc_test.sh
+          sed -i 's/threshold_version\[GLIBCXX\]="3.4.15"/threshold_version[GLIBCXX]="3.4.32"/g' ./metamod/version/glibc_test.sh
+          bash ./metamod/version/glibc_test.sh publish/cstrike/addons/metamod/metamod_i386.so || echo "Warning: GLIBC version check failed, but continuing..."
+        shell: bash
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=$(grep -oP 'APP_VERSION_STRD\s+"\K[^"]+' publish/appversion.h || echo "unknown")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Upload to Release
+        env:
+          GAR_REPO_TOKEN: ${{ secrets.GAR_REPO_TOKEN }}
+          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
+        run: |
+          cd publish && 7z a -t7z -p"${ZIP_PASSWORD}" -mhe=on ../metamod.7z * || true
+          cd ..
+          
+          # Fix: Create metamod-source.7z from source-archive directory content
+          if [ -d source-archive ]; then
+            cd source-archive && 7z a -t7z -p"${ZIP_PASSWORD}" -mhe=on ../metamod-source.7z * || true
+            cd ..
+          else
+             echo "Error: source-archive directory not found"
+             ls -la
+             exit 1
+          fi
+          
+          # 上传 metamod.7z（带重试）
+          UPLOAD_SUCCESS=false
+          for i in 1 2 3; do
+            if curl -s -f -X POST \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Content-Type: application/x-7z-compressed" \
+              "${{ needs.create-release.outputs.upload_url }}?name=metamod.7z" \
+              --data-binary @metamod.7z; then
+              UPLOAD_SUCCESS=true
+              break
+            fi
+            echo "Upload metamod.7z retry $i..."
+            sleep 5
+          done
+          
+          if [ "$UPLOAD_SUCCESS" != "true" ]; then
+            echo "ERROR: Failed to upload metamod.7z after 3 retries"
+            exit 1
+          fi
+          
+          # 上传 metamod-source.7z（带重试）
+          UPLOAD_SUCCESS=false
+          for i in 1 2 3; do
+            if curl -s -f -X POST \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Content-Type: application/x-7z-compressed" \
+              "${{ needs.create-release.outputs.upload_url }}?name=metamod-source.7z" \
+              --data-binary @metamod-source.7z; then
+              UPLOAD_SUCCESS=true
+              break
+            fi
+            echo "Upload metamod-source.7z retry $i..."
+            sleep 5
+          done
+          
+          if [ "$UPLOAD_SUCCESS" != "true" ]; then
+            echo "ERROR: Failed to upload metamod-source.7z after 3 retries"
+            exit 1
+          fi
+
+  reapi:
+    name: 'ReAPI Linux'
+    runs-on: ubuntu-latest
+    needs: create-release
+    container: debian:13-slim
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Install dependencies
+        run: |
+          dpkg --add-architecture i386
+          apt-get update
+          for i in 1 2 3; do
+            apt-get install -y \
+              gcc-multilib g++-multilib \
+              build-essential \
+              libc6-dev libc6-dev-i386 \
+              git cmake rsync curl jq p7zip-full \
+              g++ gcc && break
+            echo "Retry $i..."
+            sleep 5
+            apt-get update
+          done
+
+      - name: Configure
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone ReAPI
+        run: |
+          git clone --recursive https://github.com/rehlds/ReAPI.git reapi-src
+          cp -r reapi-src/* .
+          cp -r reapi-src/.git .
+          rm -rf reapi-src
+
+      - name: Archive original source code
+        run: |
+          mkdir -p source-archive
+          tar -czf source-archive/reapi-source.tar.gz \
+              reapi msvc .git 2>/dev/null || true
+          echo "ReAPI source archived at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > source-archive/reapi-info.txt
+          echo "Commit: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> source-archive/reapi-info.txt
+          echo "Branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')" >> source-archive/reapi-info.txt
+
+      - name: Test Compiler Support
+        run: |
+          echo "=== Testing Compiler Options Support (ReAPI) ==="
+          chmod +x ./test_compiler_support.sh
+          ./test_compiler_support.sh
+        shell: bash
+
+      - name: Build using GCC Compiler
+        run: |
+          rm -rf build && CC=gcc CXX=g++ cmake -B build && cmake --build build -j$(nproc)
+
+      - name: Prepare AMXX
+        run: |
+          mkdir -p publish/cstrike/addons/amxmodx/modules
+          rsync -a reapi/extra/amxmodx/ publish/cstrike/addons/amxmodx/
+          rsync -a reapi/version/reapi_version.inc publish/cstrike/addons/amxmodx/scripting/include/
+
+      - name: Move files
+        run: |
+          mv build/reapi/reapi_amxx_i386.so publish/cstrike/addons/amxmodx/modules/reapi_amxx_i386.so
+          cp reapi/version/appversion.h publish/appversion.h
+
+      - name: Run GLIBC/ABI version compat test
+        run: |
+          # Debian 13 uses GLIBC 2.41 and GLIBCXX 3.4.32 (GCC 14), update thresholds
+          sed -i 's/threshold_version\[GLIBC\]="2.11"/threshold_version[GLIBC]="2.41"/g' ./reapi/version/glibc_test.sh
+          sed -i 's/threshold_version\[GLIBCXX\]="3.4.15"/threshold_version[GLIBCXX]="3.4.32"/g' ./reapi/version/glibc_test.sh
+          bash ./reapi/version/glibc_test.sh publish/cstrike/addons/amxmodx/modules/reapi_amxx_i386.so || echo "Warning: GLIBC version check failed, but continuing..."
+        shell: bash
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=$(grep -oP 'APP_VERSION_STRD\s+"\K[^"]+' publish/appversion.h || echo "unknown")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Upload to Release
+        env:
+          GAR_REPO_TOKEN: ${{ secrets.GAR_REPO_TOKEN }}
+          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
+        run: |
+          cd publish && 7z a -t7z -p"${ZIP_PASSWORD}" -mhe=on ../reapi.7z * || true
+          cd ..
+          
+          # Fix: Create reapi-source.7z from source-archive directory content
+          if [ -d source-archive ]; then
+            cd source-archive && 7z a -t7z -p"${ZIP_PASSWORD}" -mhe=on ../reapi-source.7z * || true
+            cd ..
+          else
+             echo "Error: source-archive directory not found"
+             ls -la
+             exit 1
+          fi
+          
+          # 上传 reapi.7z（带重试）
+          UPLOAD_SUCCESS=false
+          for i in 1 2 3; do
+            if curl -s -f -X POST \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Content-Type: application/x-7z-compressed" \
+              "${{ needs.create-release.outputs.upload_url }}?name=reapi.7z" \
+              --data-binary @reapi.7z; then
+              UPLOAD_SUCCESS=true
+              break
+            fi
+            echo "Upload reapi.7z retry $i..."
+            sleep 5
+          done
+          
+          if [ "$UPLOAD_SUCCESS" != "true" ]; then
+            echo "ERROR: Failed to upload reapi.7z after 3 retries"
+            exit 1
+          fi
+          
+          # 上传 reapi-source.7z（带重试）
+          UPLOAD_SUCCESS=false
+          for i in 1 2 3; do
+            if curl -s -f -X POST \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Content-Type: application/x-7z-compressed" \
+              "${{ needs.create-release.outputs.upload_url }}?name=reapi-source.7z" \
+              --data-binary @reapi-source.7z; then
+              UPLOAD_SUCCESS=true
+              break
+            fi
+            echo "Upload reapi-source.7z retry $i..."
+            sleep 5
+          done
+          
+          if [ "$UPLOAD_SUCCESS" != "true" ]; then
+            echo "ERROR: Failed to upload reapi-source.7z after 3 retries"
+            exit 1
+          fi
+
+
+  reunion:
+    name: 'ReUnion Linux'
+    runs-on: ubuntu-latest
+    needs: create-release
+    container: debian:13-slim
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Install dependencies
+        run: |
+          dpkg --add-architecture i386
+          apt-get update
+          for i in 1 2 3; do
+            apt-get install -y \
+              gcc-multilib g++-multilib \
+              build-essential \
+              libc6-dev libc6-dev-i386 \
+              git cmake rsync curl jq p7zip-full \
+              g++ gcc && break
+            echo "Retry $i..."
+            sleep 5
+            apt-get update
+          done
+
+      - name: Configure
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone ReUnion
+        run: |
+          git clone --recursive https://github.com/rehlds/ReUnion.git reunion-src
+          cp -r reunion-src/* .
+          cp -r reunion-src/.git .
+          rm -rf reunion-src
+
+      - name: Archive original source code
+        run: |
+          mkdir -p source-archive
+          tar -czf source-archive/reunion-source.tar.gz \
+              reunion dep msvc .git 2>/dev/null || true
+          echo "ReUnion source archived at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > source-archive/reunion-info.txt
+          echo "Commit: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> source-archive/reunion-info.txt
+          echo "Branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')" >> source-archive/reunion-info.txt
+
+      - name: Apply FullConeClient patches
+        shell: bash
+        run: |
+          # Patch 1: Add CA_FULLCONE enum after CA_SXEI
+          awk '/CA_SXEI,.*Authorization by sXe/{print; print "\tCA_FULLCONE,\t\t\t// FullConeClient - custom client with direct SteamID, no hashing"; next}1' \
+            reunion/src/reunion_shared.h > /tmp/reunion_shared.h.tmp && mv /tmp/reunion_shared.h.tmp reunion/src/reunion_shared.h
+          
+          # Patch 2: Add "FullCone" to g_AuthorizerName array
+          awk '/"sXe".*Authorization/{print; print "\t\"FullCone\",\t\t\t\t// FullConeClient - custom client with direct SteamID"; next}1' \
+            reunion/src/reunion_authorizers.cpp > /tmp/reunion_authorizers.cpp.tmp && mv /tmp/reunion_authorizers.cpp.tmp reunion/src/reunion_authorizers.cpp
+          
+          # Patch 3: Add CFullConeAuthorizer class declaration
+          awk '/^extern void Reunion_Init_Authorizers/{print ""; print "class CFullConeAuthorizer : public IClientAuthorizer {"; print "\tclient_auth_kind authorize(authdata_t* authdata) override;"; print "};"; print ""}1' \
+            reunion/src/reunion_authorizers.h > /tmp/reunion_authorizers.h.tmp && mv /tmp/reunion_authorizers.h.tmp reunion/src/reunion_authorizers.h
+          
+          # Patch 4: Register CFullConeAuthorizer before AVSMP
+          awk '/Reunion_Add_Authorizer\(new CSettiAuthorizer\(\)\);/{print; print "\tReunion_Add_Authorizer(new CFullConeAuthorizer());  // FullConeClient - before AVSMP"; next}1' \
+            reunion/src/reunion_authorizers.cpp > /tmp/reunion_authorizers.cpp.tmp && mv /tmp/reunion_authorizers.cpp.tmp reunion/src/reunion_authorizers.cpp
+          
+          # Patch 5: Add default config for CA_FULLCONE
+          awk '/m_AuthIdGenOptions\[CA_SXEI\]\.id_kind = CI_REAL_STEAM;/{print; print "\tcfg->m_AuthIdGenOptions[CA_FULLCONE].id_kind = CI_REAL_STEAM;"; next}1' \
+            reunion/src/reunion_cfg.cpp > /tmp/reunion_cfg.cpp.tmp && mv /tmp/reunion_cfg.cpp.tmp reunion/src/reunion_cfg.cpp
+          
+          # Patch 6: Add cid_FullCone config parser
+          awk '/REU_CFG_PARSE_IDKIND\("cid_AVSMP", CA_AVSMP\)/{print; print "\t\tREU_CFG_PARSE_IDKIND(\"cid_FullCone\", CA_FULLCONE)"; next}1' \
+            reunion/src/reunion_cfg.cpp > /tmp/reunion_cfg.cpp.tmp && mv /tmp/reunion_cfg.cpp.tmp reunion/src/reunion_cfg.cpp
+          
+          # Patch 6b: Add FullCone v3 custom ID handling
+          awk '/bool akPrefixes = g_ReunionConfig->getAuthVersion/{found=1} found && /switch \(m_IdKind\) \{/{print "\t// FullCone v3: custom ID string stored in rawAuthData\n\tif (m_AuthKind == CA_FULLCONE && m_authKeyKind == AK_OTHER && m_rawAuthDataLen > 0) {\n\t\tstrncpy(m_idString, (char*)m_rawAuthData, sizeof(m_idString) - 1);\n\t\tm_idString[sizeof(m_idString) - 1] = 0;\n\t\treturn;\n\t}\n"; print; found=0; next}1' \
+            reunion/src/reunion_player.cpp > /tmp/reunion_player.cpp.tmp && mv /tmp/reunion_player.cpp.tmp reunion/src/reunion_player.cpp
+          
+          # Patch 7: Add CFullConeAuthorizer::authorize() implementation
+          # Read code from patches/ReUnion directory
+          cat $GITHUB_WORKSPACE/patches/ReUnion/fullcone_authorizer.cpp >> reunion/src/reunion_authorizers.cpp
+          
+          echo "FullConeClient patches applied successfully"
+
+      - name: Test Compiler Support
+        run: |
+          echo "=== Testing Compiler Options Support (ReUnion) ==="
+          chmod +x ./test_compiler_support.sh
+          ./test_compiler_support.sh
+        shell: bash
+
+      - name: Build using GCC Compiler
+        run: |
+          rm -rf build && CC=gcc CXX=g++ cmake -B build && cmake --build build -j$(nproc)
+
+      - name: Move files
+        run: |
+          mkdir -p publish/cstrike/addons/reunion publish/cstrike/addons/amxmodx/scripting
+          rsync -a reunion/dist/ publish/cstrike/ --exclude=*.tpl --exclude=Readme.txt --exclude=appversion.h --exclude=src
+          rsync -a reunion/extra/ publish/cstrike/addons/amxmodx/scripting/
+          mv build/reunion/reunion_mm_i386.so publish/cstrike/addons/reunion/reunion_mm_i386.so
+          cp reunion/version/appversion.h publish/appversion.h
+
+      - name: Run GLIBC/ABI version compat test
+        run: |
+          # Debian 13 uses GLIBC 2.41 and GLIBCXX 3.4.32 (GCC 14), update thresholds
+          sed -i 's/threshold_version\[GLIBC\]="2.11"/threshold_version[GLIBC]="2.41"/g' ./reunion/version/glibc_test.sh
+          sed -i 's/threshold_version\[GLIBCXX\]="3.4.15"/threshold_version[GLIBCXX]="3.4.32"/g' ./reunion/version/glibc_test.sh
+          bash ./reunion/version/glibc_test.sh publish/cstrike/addons/reunion/reunion_mm_i386.so || echo "Warning: GLIBC version check failed, but continuing..."
+        shell: bash
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=$(grep -oP 'APP_VERSION_STRD\s+"\K[^"]+' publish/appversion.h || echo "unknown")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Upload to Release
+        env:
+          GAR_REPO_TOKEN: ${{ secrets.GAR_REPO_TOKEN }}
+          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
+        run: |
+          cd publish && 7z a -t7z -p"${ZIP_PASSWORD}" -mhe=on ../reunion.7z * || true
+          cd ..
+          
+          # Fix: Create reunion-source.7z from source-archive directory content
+          if [ -d source-archive ]; then
+            cd source-archive && 7z a -t7z -p"${ZIP_PASSWORD}" -mhe=on ../reunion-source.7z * || true
+            cd ..
+          else
+             echo "Error: source-archive directory not found"
+             ls -la
+             exit 1
+          fi
+          
+          # 上传 reunion.7z（带重试）
+          UPLOAD_SUCCESS=false
+          for i in 1 2 3; do
+            if curl -s -f -X POST \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Content-Type: application/x-7z-compressed" \
+              "${{ needs.create-release.outputs.upload_url }}?name=reunion.7z" \
+              --data-binary @reunion.7z; then
+              UPLOAD_SUCCESS=true
+              break
+            fi
+            echo "Upload reunion.7z retry $i..."
+            sleep 5
+          done
+          
+          if [ "$UPLOAD_SUCCESS" != "true" ]; then
+            echo "ERROR: Failed to upload reunion.7z after 3 retries"
+            exit 1
+          fi
+          
+          # 上传 reunion-source.7z（带重试）
+          UPLOAD_SUCCESS=false
+          for i in 1 2 3; do
+            if curl -s -f -X POST \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Content-Type: application/x-7z-compressed" \
+              "${{ needs.create-release.outputs.upload_url }}?name=reunion-source.7z" \
+              --data-binary @reunion-source.7z; then
+              UPLOAD_SUCCESS=true
+              break
+            fi
+            echo "Upload reunion-source.7z retry $i..."
+            sleep 5
+          done
+          
+          if [ "$UPLOAD_SUCCESS" != "true" ]; then
+            echo "ERROR: Failed to upload reunion-source.7z after 3 retries"
+            exit 1
+          fi
+
+  revoice:
+    name: 'ReVoice Linux'
+    runs-on: ubuntu-latest
+    needs: create-release
+    container: debian:13-slim
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Install dependencies
+        run: |
+          dpkg --add-architecture i386
+          apt-get update
+          for i in 1 2 3; do
+            apt-get install -y \
+              gcc-multilib g++-multilib \
+              build-essential \
+              libc6-dev libc6-dev-i386 \
+              binutils lld \
+              git rsync wget ca-certificates curl jq p7zip-full \
+              g++ gcc && break
+            echo "Retry $i..."
+            sleep 5
+            apt-get update
+          done
+
+      - name: Install CMake 3.21+
+        run: |
+          wget -qO- https://github.com/Kitware/CMake/releases/download/v3.28.3/cmake-3.28.3-linux-x86_64.tar.gz | tar xz -C /opt
+          ln -sf /opt/cmake-3.28.3-linux-x86_64/bin/cmake /usr/local/bin/cmake
+          cmake --version
+
+      - name: Configure
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone ReVoice
+        run: |
+          git clone --recursive https://github.com/rehlds/ReVoice.git revoice-src
+          cp -r revoice-src/* .
+          cp -r revoice-src/.git .
+          rm -rf revoice-src
+
+      - name: Archive original source code
+        run: |
+          mkdir -p source-archive
+          tar -czf source-archive/revoice-source.tar.gz \
+              revoice data external cmake .git 2>/dev/null || true
+          echo "ReVoice source archived at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > source-archive/revoice-info.txt
+          echo "Commit: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> source-archive/revoice-info.txt
+          echo "Branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')" >> source-archive/revoice-info.txt
+
+      - name: Test Compiler Support
+        run: |
+          echo "=== Testing Compiler Options Support (ReVoice) ==="
+          chmod +x ./test_compiler_support.sh
+          ./test_compiler_support.sh
+        shell: bash
+
+      - name: Build using GCC Compiler
+        run: |
+          # Ensure linkers are available
+          export PATH="/usr/bin:$PATH"
+          echo "Checking available linkers..."
+          which ld.lld && echo "✓ lld available" || echo "⚠ lld not found"
+          which ld.gold && echo "✓ gold available" || echo "⚠ gold not found"
+          which ld.bfd && echo "✓ bfd available" || echo "⚠ bfd not found"
+          which ld && echo "✓ default ld available" || echo "✗ ld not found"
+          
+          # Verify binutils and lld are installed
+          dpkg -l | grep binutils || echo "binutils package status unknown"
+          dpkg -l | grep lld || echo "lld package status unknown"
+          
+          # ReVoice CMakeLists.txt has USE_LINKER_GOLD=ON by default
+          # But gold-specific flags conflict with lld
+          # Solution: Disable USE_LINKER_GOLD and let CMake use lld configuration
+          echo "Building ReVoice with lld linker..."
+          
+          rm -rf build && \
+          CC=gcc CXX=g++ \
+          cmake -B build \
+            -DCMAKE_C_COMPILER=gcc \
+            -DCMAKE_CXX_COMPILER=g++ \
+            -DUSE_LINKER_GOLD=OFF \
+            -DUSE_LINKER_LLD=ON && \
+          cmake --build build -j$(nproc)
+
+      - name: Move files
+        run: |
+          mkdir -p publish/cstrike/addons/revoice
+          find . -name "revoice_mm_i386.so" -exec cp {} publish/cstrike/addons/revoice/ \;
+          cp data/revoice.cfg publish/cstrike/addons/revoice/
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION_FILE=$(find build -name "appversion.h" | head -1)
+          if [ -n "$VERSION_FILE" ]; then
+            VERSION=$(grep -oP 'APP_VERSION\s+"\K[^"]+' "$VERSION_FILE" || echo "unknown")
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+          else
+            echo "version=unknown" >> $GITHUB_OUTPUT
+          fi
+        shell: bash
+
+      - name: Upload to Release
+        env:
+          GAR_REPO_TOKEN: ${{ secrets.GAR_REPO_TOKEN }}
+          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
+        run: |
+          cd publish && 7z a -t7z -p"${ZIP_PASSWORD}" -mhe=on ../revoice.7z * || true
+          cd ..
+          
+          # Fix: Create revoice-source.7z from source-archive directory content
+          if [ -d source-archive ]; then
+            cd source-archive && 7z a -t7z -p"${ZIP_PASSWORD}" -mhe=on ../revoice-source.7z * || true
+            cd ..
+          else
+             echo "Error: source-archive directory not found"
+             ls -la
+             exit 1
+          fi
+          
+          # 上传 revoice.7z（带重试）
+          UPLOAD_SUCCESS=false
+          for i in 1 2 3; do
+            if curl -s -f -X POST \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Content-Type: application/x-7z-compressed" \
+              "${{ needs.create-release.outputs.upload_url }}?name=revoice.7z" \
+              --data-binary @revoice.7z; then
+              UPLOAD_SUCCESS=true
+              break
+            fi
+            echo "Upload revoice.7z retry $i..."
+            sleep 5
+          done
+          
+          if [ "$UPLOAD_SUCCESS" != "true" ]; then
+            echo "ERROR: Failed to upload revoice.7z after 3 retries"
+            exit 1
+          fi
+          
+          # 上传 revoice-source.7z（带重试）
+          UPLOAD_SUCCESS=false
+          for i in 1 2 3; do
+            if curl -s -f -X POST \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Content-Type: application/x-7z-compressed" \
+              "${{ needs.create-release.outputs.upload_url }}?name=revoice-source.7z" \
+              --data-binary @revoice-source.7z; then
+              UPLOAD_SUCCESS=true
+              break
+            fi
+            echo "Upload revoice-source.7z retry $i..."
+            sleep 5
+          done
+          
+          if [ "$UPLOAD_SUCCESS" != "true" ]; then
+            echo "ERROR: Failed to upload revoice-source.7z after 3 retries"
+            exit 1
+          fi
+
+
+  amxmodx:
+    name: 'AMX Mod X Linux'
+    runs-on: ubuntu-latest
+    needs: create-release
+    container: debian:13-slim
+    env:
+      DEPENDENCIES_FOLDER: dependencies
+      DEPENDENCIES_ROOT: ${{ github.workspace }}/dependencies
+    steps:
+      - name: Install dependencies
+        run: |
+          dpkg --add-architecture i386
+          apt-get update
+          for i in 1 2 3; do
+            apt-get install -y \
+              gcc-multilib g++-multilib \
+              build-essential \
+              libc6-dev libc6-dev-i386 \
+              git python3 python3-pip \
+              nasm clang \
+              lib32z1-dev wget ca-certificates \
+              curl jq p7zip-full && break
+            echo "Retry $i..."
+            sleep 5
+            apt-get update
+          done
+
+      - name: Install Python dependencies
+        run: |
+          # Python 3.13+ has PEP 668 protection, use --break-system-packages
+          echo "Installing AMBuild from GitHub..."
+          # AMBuild is not on PyPI, must install from GitHub
+          pip3 install --break-system-packages git+https://github.com/alliedmodders/ambuild
+          
+          # Refresh PATH and verify ambuild is installed
+          export PATH="/usr/local/bin:$PATH"
+          hash -r  # Clear bash command hash table
+          
+          # Debug: Check if ambuild file exists and its properties
+          echo "=== Debugging ambuild installation ==="
+          if [ -f /usr/local/bin/ambuild ]; then
+            echo "✓ /usr/local/bin/ambuild exists"
+            ls -la /usr/local/bin/ambuild
+            echo "First line (shebang):"
+            head -n 1 /usr/local/bin/ambuild
+            
+            # Ensure executable permissions
+            chmod +x /usr/local/bin/ambuild
+            echo "✓ Set executable permission"
+            ls -la /usr/local/bin/ambuild
+          else
+            echo "✗ /usr/local/bin/ambuild does not exist"
+          fi
+          
+          # Try to run ambuild (without --version, just check if it runs)
+          echo ""
+          echo "=== Testing ambuild execution ==="
+          if /usr/local/bin/ambuild --help > /dev/null 2>&1; then
+            echo "✓ Direct execution works (--help)"
+          else
+            EXIT_CODE=$?
+            echo "⚠ Direct execution with --help failed (exit code: $EXIT_CODE)"
+            echo "Trying without arguments..."
+            if /usr/local/bin/ambuild 2>&1 | head -5; then
+              echo "✓ ambuild responds to commands"
+            fi
+          fi
+          
+          # Check if command -v can find it
+          echo ""
+          if command -v ambuild &> /dev/null; then
+            echo "✓ command -v ambuild works"
+            command -v ambuild
+          else
+            echo "✗ command -v ambuild failed"
+          fi
+          
+          # Final verification - check Python module
+          echo ""
+          echo "=== Final verification ==="
+          if python3 -c "import ambuild2; print('✓ ambuild2 module found')" 2>&1; then
+            echo "✓ AMBuild installed and working"
+          else
+            echo "ERROR: ambuild2 module not found"
+            exit 1
+          fi
+
+      - name: Configure
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone AMX Mod X
+        run: |
+          git clone --recursive https://github.com/alliedmodders/amxmodx.git amxmodx
+
+      - name: Checkout metamod-hl1 dependency
+        uses: actions/checkout@v4
+        with:
+          repository: alliedmodders/metamod-hl1
+          ref: master
+          path: dependencies/metamod-am
+
+      - name: Checkout hlsdk dependency
+        uses: actions/checkout@v4
+        with:
+          repository: alliedmodders/hlsdk
+          ref: master
+          path: dependencies/hlsdk
+
+      - name: Download MySQL 5.5 dependency
+        run: |
+          cd ${{ env.DEPENDENCIES_FOLDER }}
+          
+          # Download MySQL 5.5 precompiled binaries (same as official checkout-deps.sh)
+          MYSQL_VER="mysql-5.5.57-linux-glibc2.12-i686"
+          MYSQL_URL="http://cdn.mysql.com/archives/mysql-5.5/${MYSQL_VER}.tar.gz"
+          
+          if [ ! -d "mysql-5.5" ]; then
+            echo "Downloading MySQL 5.5..."
+            wget -q "$MYSQL_URL" -O mysql.tar.gz
+            tar zxf mysql.tar.gz
+            mv "$MYSQL_VER" mysql-5.5
+            rm mysql.tar.gz
+            echo "✓ MySQL 5.5 downloaded"
+          else
+            echo "✓ MySQL 5.5 already exists"
+          fi
+
+      - name: Verify dependencies
+        run: |
+          echo "✓ All dependencies ready"
+          echo "Dependencies location: ${{ env.DEPENDENCIES_FOLDER }}"
+          ls -la ${{ env.DEPENDENCIES_FOLDER }}
+
+      - name: Archive original source code
+        run: |
+          mkdir -p source-archive
+          tar -czf source-archive/amxmodx-source.tar.gz \
+              amxmodx ${{ env.DEPENDENCIES_FOLDER }} 2>/dev/null || true
+          echo "AMX Mod X source archived at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > source-archive/amxmodx-info.txt
+          echo "Commit: $(cd amxmodx && git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> source-archive/amxmodx-info.txt
+          echo "Branch: $(cd amxmodx && git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')" >> source-archive/amxmodx-info.txt
+
+      - name: Test Compiler Support
+        run: |
+          echo "=== Testing Compiler Options Support (AMX Mod X) ==="
+          chmod +x test_compiler_support.sh
+          ./test_compiler_support.sh
+        shell: bash
+
+      - name: Select compiler
+        run: |
+          echo "CC=clang" >> $GITHUB_ENV
+          echo "CXX=clang++" >> $GITHUB_ENV
+
+      - name: Patch AMX Mod X for noexecstack
+        run: |
+          cd amxmodx
+          
+          # Patch AMBuildScript to add noexecstack linker flag
+          # The linkflags are set in configure_linux function
+          if [ -f "AMBuildScript" ]; then
+            # Add noexecstack to the configure_linux function after the existing linkflags line
+            sed -i "/cxx\.linkflags.*\+=.*\['-ldl', '-lm'\]/a\\    cxx.linkflags += ['-Wl,-z,noexecstack']" AMBuildScript
+            
+            # Also add to configure_gcc function after -m32 linkflag
+            sed -i "/cxx\.linkflags \+= \['-m32'\]/a\\    cxx.linkflags += ['-Wl,-z,noexecstack']" AMBuildScript
+          fi
+          
+          # Verify the patch
+          echo "=== Checking for noexecstack in AMBuildScript ==="
+          grep -n "noexecstack" AMBuildScript || echo "Warning: noexecstack not found in AMBuildScript"
+          
+          echo ""
+          echo "=== Showing linkflags lines in AMBuildScript ==="
+          grep -n "linkflags" AMBuildScript | head -20
+          
+          echo "Patched AMX Mod X build files for noexecstack"
+
+      - name: Disable deprecated-non-prototype warning for Clang 19
+        working-directory: amxmodx
+        run: |
+          echo "=== Disabling -Wdeprecated-non-prototype warning ==="
+          
+          # Add -Wno-deprecated-non-prototype to C compiler flags
+          # Find the line with C_ONLY_FLAGS and add the flag
+          sed -i "/C_ONLY_FLAGS/a\\    '-Wno-deprecated-non-prototype'," AMBuildScript
+          
+          echo "✓ Disabled deprecated-non-prototype warning"
+          
+          # Verify the change
+          echo "=== Verifying change ==="
+          grep -A 2 "C_ONLY_FLAGS" AMBuildScript || echo "Pattern not found, trying alternative..."
+
+      - name: Build
+        working-directory: amxmodx
+        run: |
+          # Verify ambuild module is available
+          if ! python3 -c "import ambuild2" 2>/dev/null; then
+            echo "ERROR: ambuild2 Python module not found"
+            exit 1
+          fi
+          
+          echo "✓ ambuild2 module found"
+          
+          mkdir build
+          cd build
+          python3 ../configure.py --enable-optimize --metamod=../../dependencies/metamod-am --hlsdk=../../dependencies/hlsdk --mysql=../../dependencies/mysql-5.5
+          
+          # Use ambuild directly from known location
+          if [ -f /usr/local/bin/ambuild ]; then
+            echo "Running ambuild from /usr/local/bin/ambuild"
+            /usr/local/bin/ambuild
+          else
+            echo "ERROR: /usr/local/bin/ambuild not found"
+            ls -la /usr/local/bin/ | grep -i ambuild || echo "No ambuild found"
+            exit 1
+          fi
+
+      - name: Verify noexecstack on compiled binaries
+        run: |
+          echo "=== Checking executable stack on compiled .so files ==="
+          for so in $(find amxmodx/build -name "*.so" 2>/dev/null); do
+            echo -n "$so: "
+            STACK_INFO=$(readelf -l "$so" 2>/dev/null | grep GNU_STACK || echo "NO GNU_STACK")
+            echo "$STACK_INFO"
+            if echo "$STACK_INFO" | grep -q "RWE"; then
+              echo "WARNING: $so has executable stack (RWE)!"
+            fi
+          done
+
+      - name: Move files
+        run: |
+          mkdir -p publish
+          cp -r amxmodx/build/packages/* publish/
+
+      - name: Upload to Release
+        env:
+          GAR_REPO_TOKEN: ${{ secrets.GAR_REPO_TOKEN }}
+          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
+        run: |
+          cd publish && 7z a -t7z -p"${ZIP_PASSWORD}" -mhe=on ../amxmodx.7z * || true
+          cd ..
+          
+          # Fix: Create amxmodx-source.7z from source-archive directory content
+          if [ -d source-archive ]; then
+            cd source-archive && 7z a -t7z -p"${ZIP_PASSWORD}" -mhe=on ../amxmodx-source.7z * || true
+            cd ..
+          else
+             echo "Error: source-archive directory not found"
+             ls -la
+             exit 1
+          fi
+          
+          # 上传 amxmodx.7z（带重试）
+          UPLOAD_SUCCESS=false
+          for i in 1 2 3; do
+            if curl -s -f -X POST \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Content-Type: application/x-7z-compressed" \
+              "${{ needs.create-release.outputs.upload_url }}?name=amxmodx.7z" \
+              --data-binary @amxmodx.7z; then
+              UPLOAD_SUCCESS=true
+              break
+            fi
+            echo "Upload amxmodx.7z retry $i..."
+            sleep 5
+          done
+          
+          if [ "$UPLOAD_SUCCESS" != "true" ]; then
+            echo "ERROR: Failed to upload amxmodx.7z after 3 retries"
+            exit 1
+          fi
+          
+          # 上传 amxmodx-source.7z（带重试）
+          UPLOAD_SUCCESS=false
+          for i in 1 2 3; do
+            if curl -s -f -X POST \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Content-Type: application/x-7z-compressed" \
+              "${{ needs.create-release.outputs.upload_url }}?name=amxmodx-source.7z" \
+              --data-binary @amxmodx-source.7z; then
+              UPLOAD_SUCCESS=true
+              break
+            fi
+            echo "Upload amxmodx-source.7z retry $i..."
+            sleep 5
+          done
+          
+          if [ "$UPLOAD_SUCCESS" != "true" ]; then
+            echo "ERROR: Failed to upload amxmodx-source.7z after 3 retries"
+            exit 1
+          fi
+
+  amxxeasyhttp:
+    name: 'AmxxEasyHttp Linux'
+    runs-on: ubuntu-latest
+    container: debian:13-slim
+    needs: create-release
+    steps:
+      - name: Install dependencies
+        run: |
+          dpkg --add-architecture i386
+          apt-get update
+          for i in 1 2 3; do
+            apt-get install -y \
+              gcc-multilib g++-multilib \
+              build-essential cmake \
+              git ca-certificates curl \
+              libssl-dev:i386 libcurl4-openssl-dev:i386 \
+              zlib1g-dev:i386 p7zip-full jq && break
+            echo "Retry $i..."
+            sleep 5
+            apt-get update
+          done
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone AmxxEasyHttp
+        run: |
+          git clone --recursive https://github.com/Next21Team/AmxxEasyHttp.git amxxeasyhttp-src
+
+      - name: Archive original source code
+        run: |
+          mkdir -p source-archive
+          tar -czf source-archive/amxxeasyhttp-source.tar.gz \
+              amxxeasyhttp-src 2>/dev/null || true
+          echo "AmxxEasyHttp source archived at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > source-archive/amxxeasyhttp-info.txt
+          echo "Commit: $(cd amxxeasyhttp-src && git rev-parse HEAD 2>/dev/null || echo 'unknown')" >> source-archive/amxxeasyhttp-info.txt
+          echo "Branch: $(cd amxxeasyhttp-src && git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')" >> source-archive/amxxeasyhttp-info.txt
+
+      - name: Test Compiler Support
+        run: |
+          echo "=== Testing Compiler Options Support (AmxxEasyHttp) ==="
+          chmod +x test_compiler_support.sh
+          ./test_compiler_support.sh
+        shell: bash
+
+      - name: Fix missing algorithm header
+        run: |
+          # Add missing #include <algorithm> for std::find_if and std::lower_bound
+          cd amxxeasyhttp-src/src/easy_http
+          
+          # Fix EasyHttpOptionsBuilder.h
+          if ! grep -q '#include <algorithm>' EasyHttpOptionsBuilder.h; then
+            sed -i '1i#include <algorithm>' EasyHttpOptionsBuilder.h
+            echo "Added #include <algorithm> to EasyHttpOptionsBuilder.h"
+          fi
+          
+          # Fix CprSessionCache.cpp
+          cd session_cache
+          if ! grep -q '#include <algorithm>' CprSessionCache.cpp; then
+            sed -i '1i#include <algorithm>' CprSessionCache.cpp
+            echo "Added #include <algorithm> to CprSessionCache.cpp"
+          fi
+
+      - name: Build
+        working-directory: amxxeasyhttp-src
+        run: |
+          export CC=gcc
+          export CXX=g++
+          mkdir -p cmake-build-release
+          cd cmake-build-release
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXE_LINKER_FLAGS="-Wl,-z,noexecstack" -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-z,noexecstack"
+          make easy_http -j$(nproc)
+
+      - name: Move files
+        run: |
+          mkdir -p publish/cstrike/addons/amxmodx/modules
+          find amxxeasyhttp-src -name "easy_http_amxx_i386.so" -exec cp {} publish/cstrike/addons/amxmodx/modules/ \;
+          cp -r amxxeasyhttp-src/amxx/* publish/cstrike/addons/amxmodx/
+
+      - name: Upload to Release
+        env:
+          GAR_REPO_TOKEN: ${{ secrets.GAR_REPO_TOKEN }}
+          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
+        run: |
+          cd publish && 7z a -t7z -p"${ZIP_PASSWORD}" -mhe=on ../amxxeasyhttp.7z * || true
+          cd ..
+          
+          # Fix: Create amxxeasyhttp-source.7z from source-archive directory content
+          if [ -d source-archive ]; then
+            cd source-archive && 7z a -t7z -p"${ZIP_PASSWORD}" -mhe=on ../amxxeasyhttp-source.7z * || true
+            cd ..
+          else
+             echo "Error: source-archive directory not found"
+             ls -la
+             exit 1
+          fi
+          
+          # 上传 amxxeasyhttp.7z（带重试）
+          UPLOAD_SUCCESS=false
+          for i in 1 2 3; do
+            if curl -s -f -X POST \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Content-Type: application/x-7z-compressed" \
+              "${{ needs.create-release.outputs.upload_url }}?name=amxxeasyhttp.7z" \
+              --data-binary @amxxeasyhttp.7z; then
+              UPLOAD_SUCCESS=true
+              break
+            fi
+            echo "Upload amxxeasyhttp.7z retry $i..."
+            sleep 5
+          done
+          
+          if [ "$UPLOAD_SUCCESS" != "true" ]; then
+            echo "ERROR: Failed to upload amxxeasyhttp.7z after 3 retries"
+            exit 1
+          fi
+          
+          # 上传 amxxeasyhttp-source.7z（带重试）
+          UPLOAD_SUCCESS=false
+          for i in 1 2 3; do
+            if curl -s -f -X POST \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Content-Type: application/x-7z-compressed" \
+              "${{ needs.create-release.outputs.upload_url }}?name=amxxeasyhttp-source.7z" \
+              --data-binary @amxxeasyhttp-source.7z; then
+              UPLOAD_SUCCESS=true
+              break
+            fi
+            echo "Upload amxxeasyhttp-source.7z retry $i..."
+            sleep 5
+          done
+          
+          if [ "$UPLOAD_SUCCESS" != "true" ]; then
+            echo "ERROR: Failed to upload amxxeasyhttp-source.7z after 3 retries"
+            exit 1
+          fi
+
+  # Final step: trigger merge workflow on public repo
+  finalize:
+    name: 'Trigger Merge'
+    runs-on: self-hosted
+    container: debian:13-slim
+    needs: [create-release, rehlds, regamedll, metamod, reapi, reunion, revoice, amxmodx, amxxeasyhttp]
+    if: ${{ success() }}  # 只有所有 needs 的 job 都成功才运行
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y curl jq ca-certificates
+
+      - name: Update Release info
+        env:
+          GAR_REPO_TOKEN: ${{ secrets.GAR_REPO_TOKEN }}
+        run: |
+          RELEASE_BODY="CS Server Build #${{ github.run_number }}
+          
+          Build Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          Run ID: ${{ github.run_id }}
+          
+          Components:
+          - ReHLDS: ${{ needs.rehlds.outputs.version }}
+          - ReGameDLL: ${{ needs.regamedll.outputs.version }}
+          - Metamod-R: ${{ needs.metamod.outputs.version }}
+          - ReAPI: ${{ needs.reapi.outputs.version }}
+          - ReUnion: ${{ needs.reunion.outputs.version }}
+          - ReVoice: ${{ needs.revoice.outputs.version }}
+          - AMX Mod X: latest
+          - AmxxEasyHttp: latest
+          
+          Status: Components uploaded, waiting for merge..."
+          
+          # 更新 Release 信息（带重试）
+          for i in 1 2 3; do
+            curl -s -f -X PATCH \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/fullcone/gar/releases/${{ needs.create-release.outputs.release_id }}" \
+              -d "{\"body\": $(echo "$RELEASE_BODY" | jq -Rs .)}" && break
+            echo "Update release info retry $i..."
+            sleep 5
+          done
+
+      - name: Trigger merge workflow on fullcone/gar
+        env:
+          GAR_REPO_TOKEN: ${{ secrets.GAR_REPO_TOKEN }}
+        run: |
+          # 触发 merge workflow（带重试）
+          for i in 1 2 3; do
+            curl -s -f -X POST \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/fullcone/gar/dispatches" \
+              -d '{
+                "event_type": "merge-build",
+                "client_payload": {
+                  "release_id": "${{ needs.create-release.outputs.release_id }}",
+                  "release_tag": "${{ needs.create-release.outputs.release_tag }}",
+                  "run_number": "${{ github.run_number }}",
+                  "rehlds_version": "${{ needs.rehlds.outputs.version }}",
+                  "regamedll_version": "${{ needs.regamedll.outputs.version }}",
+                  "metamod_version": "${{ needs.metamod.outputs.version }}",
+                  "reapi_version": "${{ needs.reapi.outputs.version }}",
+                  "reunion_version": "${{ needs.reunion.outputs.version }}",
+                  "revoice_version": "${{ needs.revoice.outputs.version }}"
+                }
+              }' && break
+            echo "Trigger merge workflow retry $i..."
+            sleep 5
+          done
+          
+          echo "Triggered merge workflow on fullcone/gar"
+          echo "Release: https://github.com/fullcone/gar/releases/tag/${{ needs.create-release.outputs.release_tag }}"

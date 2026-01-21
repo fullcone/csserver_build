@@ -1,0 +1,88 @@
+name: ModelScope Upload
+
+on:
+  repository_dispatch:
+    types: [modelscope-upload]
+
+jobs:
+  upload:
+    name: 'Upload to ModelScope'
+    runs-on: ubuntu-24.04
+    env:
+      MODELSCOPE_TOKEN: ${{ secrets.MODELSCOPE_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show upload info
+        run: |
+          echo "Release ID: ${{ github.event.client_payload.release_id }}"
+          echo "Release Tag: ${{ github.event.client_payload.release_tag }}"
+          echo "Run Number: ${{ github.event.client_payload.run_number }}"
+
+      - name: Download merged file from gar release
+        env:
+          GAR_REPO_TOKEN: ${{ secrets.GAR_REPO_TOKEN }}
+        run: |
+          RELEASE_ID="${{ github.event.client_payload.release_id }}"
+          RELEASE_TAG="${{ github.event.client_payload.release_tag }}"
+          
+          # 获取 Release 信息（带重试）
+          for i in 1 2 3; do
+            RELEASE_INFO=$(curl -sf \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/fullcone/gar/releases/${RELEASE_ID}") && break
+            echo "Get release info retry $i..."
+            sleep 5
+          done
+          
+          if [ -z "$RELEASE_INFO" ]; then
+            echo "ERROR: Failed to get release info for ID: $RELEASE_ID"
+            exit 1
+          fi
+          
+          # 获取 csserver-all-in-one.7z 的下载 URL
+          ASSET_URL=$(echo "$RELEASE_INFO" | jq -r '.assets[] | select(.name == "csserver-all-in-one.7z") | .url')
+          
+          if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
+            echo "ERROR: csserver-all-in-one.7z not found in release"
+            exit 1
+          fi
+          
+          echo "Downloading csserver-all-in-one.7z..."
+          # 下载文件（带重试）
+          DOWNLOAD_SUCCESS=false
+          for i in 1 2 3; do
+            rm -f csserver-all-in-one.7z
+            if curl -fSL \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Accept: application/octet-stream" \
+              "$ASSET_URL" -o csserver-all-in-one.7z && [ -f csserver-all-in-one.7z ] && [ -s csserver-all-in-one.7z ]; then
+              DOWNLOAD_SUCCESS=true
+              break
+            fi
+            echo "Download retry $i..."
+            sleep 5
+          done
+          
+          if [ "$DOWNLOAD_SUCCESS" != "true" ]; then
+            echo "ERROR: Failed to download csserver-all-in-one.7z"
+            exit 1
+          fi
+          
+          ls -lh csserver-all-in-one.7z
+
+      - name: Upload to ModelScope
+        run: |
+          # Check if ModelScope token is set
+          if [ -z "$MODELSCOPE_TOKEN" ]; then
+            echo "Warning: MODELSCOPE_TOKEN not set, skipping ModelScope upload"
+            exit 0
+          fi
+          
+          # Install modelscope
+          pip install modelscope -q
+          
+          # Run upload script
+          python3 .github/scripts/upload_modelscope.py
