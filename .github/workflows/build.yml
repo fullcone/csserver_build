@@ -600,6 +600,10 @@ jobs:
             }
           }' regamedll/dlls/player.cpp
 
+      - name: Apply pm_shared himsec patch
+        run: |
+          patch -p1 < github/patches/ReGameDLL/pm_shared_himsec.patch
+
       - name: Test Compiler Support
         run: |
           echo "=== Testing Compiler Options Support (ReGameDLL) ==="
@@ -1540,8 +1544,6 @@ jobs:
           # Add -Wno-deprecated-non-prototype to C compiler flags
           # Find the line with C_ONLY_FLAGS and add the flag
           sed -i "/C_ONLY_FLAGS/a\\    '-Wno-deprecated-non-prototype'," AMBuildScript
-          
-          echo "✓ Disabled deprecated-non-prototype warning"
           
           # Verify the change
           echo "=== Verifying change ==="

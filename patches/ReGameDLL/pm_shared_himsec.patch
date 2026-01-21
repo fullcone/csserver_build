@@ -1,0 +1,44 @@
+--- a/pm_shared/pm_shared.cpp
++++ b/pm_shared/pm_shared.cpp
+@@ -3105,7 +3105,12 @@
+ 
+ 	if (pmove->fuser2 > 0.0)
+ 	{
+-		pmove->fuser2 -= pmove->cmd.msec;
++		// ====================================================================
++		// 修复：使用 frametime（包含 himsec 高精度）代替 cmd.msec
++		// 原因：高帧率下 cmd.msec 可能为 0，导致 fuser2 不递减，惩罚期延长
++		// frametime 由服务器设置，包含客户端携带的高精度时间（himsec）
++		// ====================================================================
++		pmove->fuser2 -= pmove->frametime * 1000.0;
+ 
+ 		if (pmove->fuser2 < 0.0)
+ 		{
+@@ -3137,8 +3142,26 @@
+ 
+ 	// # of msec to apply movement
+ 
++	// ====================================================================
++	// 修复：保留服务器传入的 frametime（包含 himsec 高精度）
++	// 
++	// 服务器端（ReHLDS）会在调用 PM_PlayerMove 之前设置 pmove->frametime：
++	//   - 如果客户端支持 himsec，frametime 包含高精度时间（0.0039ms 精度）
++	//   - 如果客户端不支持，frametime 从 cmd.msec 计算（1ms 精度）
++	// 
++	// 客户端（预测）不会设置 frametime，所以需要从 cmd.msec 计算
++	// 
++	// 通过检查 frametime 是否已设置，我们可以：
++	//   - 服务器端：保留高精度 frametime（来自 himsec）
++	//   - 客户端：从 cmd.msec 计算（正常预测）
++	// ====================================================================
+ 	//double v2 = (double)pmove->cmd.msec * 0.001;
+-	pmove->frametime = pmove->cmd.msec * 0.001;
++	if (pmove->frametime <= 0.0)
++	{
++		// frametime 未设置（客户端预测），从 cmd.msec 计算
++		pmove->frametime = pmove->cmd.msec * 0.001;
++	}
++	// 如果 frametime > 0，保留它（服务器设置的高精度值）
+ 
+ 	PM_ReduceTimers();
+ 
