@@ -602,7 +602,7 @@ jobs:
 
       - name: Apply pm_shared himsec patch
         run: |
-          patch -p1 < github/patches/ReGameDLL/pm_shared_himsec.patch
+          patch -p1 < patches/ReGameDLL/pm_shared_himsec.patch
 
       - name: Test Compiler Support
         run: |
@@ -1541,13 +1541,12 @@ jobs:
         run: |
           echo "=== Disabling -Wdeprecated-non-prototype warning ==="
           
-          # Add -Wno-deprecated-non-prototype to C compiler flags
-          # Find the line with C_ONLY_FLAGS and add the flag
-          sed -i "/C_ONLY_FLAGS/a\\    '-Wno-deprecated-non-prototype'," AMBuildScript
+          # Add -Wno-deprecated-non-prototype right after -Werror (present in flags list)
+          sed -i "s/'-Werror',/'-Werror', '-Wno-deprecated-non-prototype',/" AMBuildScript
           
           # Verify the change
           echo "=== Verifying change ==="
-          grep -A 2 "C_ONLY_FLAGS" AMBuildScript || echo "Pattern not found, trying alternative..."
+          grep -n -- "-Wno-deprecated-non-prototype" AMBuildScript || echo "Pattern not found"
 
       - name: Build
         working-directory: amxmodx
