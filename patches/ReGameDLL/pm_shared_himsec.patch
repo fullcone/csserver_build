@@ -1,20 +1,123 @@
 --- a/pm_shared/pm_shared.cpp
 +++ b/pm_shared/pm_shared.cpp
-@@ -3105,7 +3105,12 @@
+@@ -2388,7 +2388,10 @@
+ 		return;
+ 	}
+ 
+-	pmove->waterjumptime -= pmove->cmd.msec;
++	// ====================================================================
++	// 修复：使用 frametime（包含 himsec 高精度）代替 cmd.msec
++	// ====================================================================
++	pmove->waterjumptime -= pmove->frametime * 1000.0;
+ 
+ 	if (pmove->waterjumptime < 0 || !pmove->waterlevel)
+ 	{
+@@ -2644,7 +2647,10 @@
+ 	// See if we are waterjumping.  If so, decrement count and return.
+ 	if (pmove->waterjumptime != 0.0f)
+ 	{
+-		pmove->waterjumptime -= pmove->cmd.msec;
++		// ====================================================================
++		// 修复：使用 frametime（包含 himsec 高精度）代替 cmd.msec
++		// ====================================================================
++		pmove->waterjumptime -= pmove->frametime * 1000.0;
+ 
+ 		if (pmove->waterjumptime < 0)
+ 		{
+@@ -2804,6 +2810,13 @@
+ 
+ 	pmove->fuser2 = 1315.789429;
+ 
++	// 调试日志：记录跳跃触发
++	if (pmove->server)
++	{
++		pmove->Con_DPrintf("[STAMINA_DEBUG] Jump triggered! fuser2 set to 1315.789, frametime=%.6f, cmd.msec=%d\n", 
++		                   pmove->frametime, pmove->cmd.msec);
++	}
++
+ 	// Decay it for simulation
+ 	PM_FixupGravityVelocity();
+ 
+@@ -3073,9 +3086,50 @@
+ 
+ void PM_ReduceTimers()
+ {
++	// ====================================================================
++	// 统一修复：所有计时器都使用 frametime（包含 himsec 高精度）代替 cmd.msec
++	// 原因：高帧率下 cmd.msec 可能为 0，导致计时器停止
++	// frametime 由服务器设置，包含客户端携带的高精度时间（himsec）
++	// ====================================================================
++	real_t frametime_ms = pmove->frametime * 1000.0;
++	
++	// ====================================================================
++	// 调试日志：监控 fuser2 递减情况
++	// ====================================================================
++	static int debug_frame_counter = 0;
++	static bool debug_penalty_active = false;
++	
++	if (pmove->server && pmove->fuser2 > 0.0)
++	{
++		// 惩罚刚开始时打印初始信息
++		if (!debug_penalty_active)
++		{
++			debug_penalty_active = true;
++			debug_frame_counter = 0;
++			pmove->Con_DPrintf("[STAMINA_DEBUG] Penalty started: fuser2=%.2f, frametime=%.6f, cmd.msec=%d\n", 
++			                   pmove->fuser2, pmove->frametime, pmove->cmd.msec);
++		}
++		
++		// 每 100 帧打印一次进度
++		if (debug_frame_counter % 100 == 0)
++		{
++			pmove->Con_DPrintf("[STAMINA_DEBUG] Frame %d: fuser2=%.2f, frametime=%.6f, frametime_ms=%.3f, cmd.msec=%d\n", 
++			                   debug_frame_counter, pmove->fuser2, pmove->frametime, frametime_ms, pmove->cmd.msec);
++		}
++		
++		debug_frame_counter++;
++	}
++	else if (debug_penalty_active && pmove->fuser2 <= 0.0)
++	{
++		// 惩罚结束时打印总结
++		debug_penalty_active = false;
++		pmove->Con_DPrintf("[STAMINA_DEBUG] Penalty ended after %d frames (%.2f seconds at current FPS)\n", 
++		                   debug_frame_counter, debug_frame_counter * pmove->frametime);
++	}
++	
+ 	if (pmove->flTimeStepSound > 0)
+ 	{
+-		pmove->flTimeStepSound -= pmove->cmd.msec;
++		pmove->flTimeStepSound -= frametime_ms;
+ 
+ 		if (pmove->flTimeStepSound < 0)
+ 		{
+@@ -3085,7 +3139,7 @@
+ 
+ 	if (pmove->flDuckTime > 0)
+ 	{
+-		pmove->flDuckTime -= pmove->cmd.msec;
++		pmove->flDuckTime -= frametime_ms;
+ 
+ 		if (pmove->flDuckTime < 0)
+ 		{
+@@ -3095,7 +3149,7 @@
+ 
+ 	if (pmove->flSwimTime > 0)
+ 	{
+-		pmove->flSwimTime -= pmove->cmd.msec;
++		pmove->flSwimTime -= frametime_ms;
+ 
+ 		if (pmove->flSwimTime < 0)
+ 		{
+@@ -3105,7 +3159,7 @@
  
  	if (pmove->fuser2 > 0.0)
  	{
 -		pmove->fuser2 -= pmove->cmd.msec;
-+		// ====================================================================
-+		// 修复：使用 frametime（包含 himsec 高精度）代替 cmd.msec
-+		// 原因：高帧率下 cmd.msec 可能为 0，导致 fuser2 不递减，惩罚期延长
-+		// frametime 由服务器设置，包含客户端携带的高精度时间（himsec）
-+		// ====================================================================
-+		pmove->fuser2 -= pmove->frametime * 1000.0;
++		pmove->fuser2 -= frametime_ms;
  
  		if (pmove->fuser2 < 0.0)
  		{
-@@ -3137,8 +3142,26 @@
+@@ -3137,8 +3191,43 @@
  
  	// # of msec to apply movement
  
@@ -33,6 +136,23 @@
 +	// ====================================================================
  	//double v2 = (double)pmove->cmd.msec * 0.001;
 -	pmove->frametime = pmove->cmd.msec * 0.001;
++	
++	// 调试日志：监控 frametime 设置
++	static int frametime_log_counter = 0;
++	if (pmove->server && frametime_log_counter++ % 1000 == 0)  // 每 1000 帧打印一次
++	{
++		if (pmove->frametime > 0.0)
++		{
++			pmove->Con_DPrintf("[STAMINA_DEBUG] Server frametime already set: %.6f (cmd.msec=%d) - using himsec\n", 
++			                   pmove->frametime, pmove->cmd.msec);
++		}
++		else
++		{
++			pmove->Con_DPrintf("[STAMINA_DEBUG] Server frametime NOT set, will use cmd.msec=%d - NO himsec support!\n", 
++			                   pmove->cmd.msec);
++		}
++	}
++	
 +	if (pmove->frametime <= 0.0)
 +	{
 +		// frametime 未设置（客户端预测），从 cmd.msec 计算
