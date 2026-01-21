@@ -50,7 +50,7 @@
  
  	// Copy movement amounts
  	fmove = pmove->cmd.forwardmove;
-@@ -1120,6 +1116,75 @@
+@@ -1120,6 +1116,71 @@
  		wishspeed = maxspeed;
  	}
  
@@ -70,12 +70,8 @@
 +	// ============================================================================
 +	if (pmove->fuser2 > 0.0)
 +	{
-+		// Get player index for accumulator
-+		int playerIndex = 0;
-+#ifdef REGAMEDLL_API
-+		if (pmoveplayer)
-+			playerIndex = pmoveplayer->entindex() - 1;
-+#endif
++		// Get player index for accumulator (pmove->player_index is 0-based)
++		int playerIndex = pmove->player_index;
 +		
 +		// Clamp to valid range
 +		if (playerIndex < 0) playerIndex = 0;
@@ -126,7 +122,7 @@
  	// Set pmove velocity
  	pmove->velocity[2] = 0;
  	PM_Accelerate(wishdir, wishspeed, pmove->movevars->accelerate);
-@@ -2388,7 +2453,10 @@
+@@ -2388,7 +2449,10 @@
  		return;
  	}
  
@@ -138,7 +134,7 @@
  
  	if (pmove->waterjumptime < 0 || !pmove->waterlevel)
  	{
-@@ -2644,7 +2712,10 @@
+@@ -2644,7 +2708,10 @@
  	// See if we are waterjumping.  If so, decrement count and return.
  	if (pmove->waterjumptime != 0.0f)
  	{
@@ -150,7 +146,7 @@
  
  		if (pmove->waterjumptime < 0)
  		{
-@@ -2804,6 +2875,13 @@
+@@ -2804,6 +2871,13 @@
  
  	pmove->fuser2 = 1315.789429;
  
@@ -164,7 +160,7 @@
  	// Decay it for simulation
  	PM_FixupGravityVelocity();
  
-@@ -3073,9 +3151,50 @@
+@@ -3073,9 +3147,50 @@
  
  void PM_ReduceTimers()
  {
@@ -216,7 +212,7 @@
  
  		if (pmove->flTimeStepSound < 0)
  		{
-@@ -3085,7 +3204,7 @@
+@@ -3085,7 +3200,7 @@
  
  	if (pmove->flDuckTime > 0)
  	{
@@ -225,7 +221,7 @@
  
  		if (pmove->flDuckTime < 0)
  		{
-@@ -3095,7 +3214,7 @@
+@@ -3095,7 +3210,7 @@
  
  	if (pmove->flSwimTime > 0)
  	{
@@ -234,7 +230,7 @@
  
  		if (pmove->flSwimTime < 0)
  		{
-@@ -3105,7 +3224,7 @@
+@@ -3105,7 +3220,7 @@
  
  	if (pmove->fuser2 > 0.0)
  	{
@@ -243,7 +239,7 @@
  
  		if (pmove->fuser2 < 0.0)
  		{
-@@ -3137,8 +3256,43 @@
+@@ -3137,8 +3252,43 @@
  
  	// # of msec to apply movement
  
