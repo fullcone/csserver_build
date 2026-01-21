@@ -602,7 +602,23 @@ jobs:
 
       - name: Apply pm_shared himsec patch
         run: |
-          patch -p1 < patches/ReGameDLL/pm_shared_himsec.patch
+          echo "=== Debug: workspace info ==="
+          pwd
+          ls -la
+          echo "=== Debug: list patches ==="
+          find . -maxdepth 3 -type f -name "pm_shared_himsec.patch" -print
+          
+          if [ -f patches/ReGameDLL/pm_shared_himsec.patch ]; then
+            PATCH_PATH="patches/ReGameDLL/pm_shared_himsec.patch"
+          elif [ -f github/patches/ReGameDLL/pm_shared_himsec.patch ]; then
+            PATCH_PATH="github/patches/ReGameDLL/pm_shared_himsec.patch"
+          else
+            echo "ERROR: patch file not found"
+            exit 1
+          fi
+          
+          echo "Applying patch: $PATCH_PATH"
+          patch -p1 < "$PATCH_PATH"
 
       - name: Test Compiler Support
         run: |
