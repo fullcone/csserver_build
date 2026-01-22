@@ -1,0 +1,431 @@
+# This file should be placed in fullcone/gar repo at .github/workflows/merge.yml
+# Receives trigger from private repo, downloads components, merges, encrypts, updates Release
+
+name: Merge Build
+
+on:
+  repository_dispatch:
+    types: [merge-build]
+
+jobs:
+  merge:
+    name: 'Merge and Encrypt'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Show build info
+        run: |
+          echo "Release ID: ${{ github.event.client_payload.release_id }}"
+          echo "Release Tag: ${{ github.event.client_payload.release_tag }}"
+          echo "Run Number: ${{ github.event.client_payload.run_number }}"
+          echo "ReHLDS: ${{ github.event.client_payload.rehlds_version }}"
+          echo "ReGameDLL: ${{ github.event.client_payload.regamedll_version }}"
+          echo "Metamod-R: ${{ github.event.client_payload.metamod_version }}"
+          echo "ReAPI: ${{ github.event.client_payload.reapi_version }}"
+          echo "ReUnion: ${{ github.event.client_payload.reunion_version }}"
+          echo "ReVoice: ${{ github.event.client_payload.revoice_version }}"
+
+      - name: Install dependencies
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full jq curl unzip rsync lib32gcc-s1 lib32stdc++6
+
+      - name: Download CS 1.6 server via SteamCMD
+        run: |
+          mkdir -p ~/steamcmd
+          cd ~/steamcmd
+          # Retry logic for SteamCMD download
+          for i in 1 2 3; do
+            if curl -sL -f "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz" -o steamcmd_linux.tar.gz; then
+              break
+            fi
+            echo "Failed to download steamcmd, retrying ($i/3)..."
+            sleep 5
+          done
+          
+          tar -xzf steamcmd_linux.tar.gz
+          
+          # Download CS 1.6 Dedicated Server (app_id 90)
+          # Retry loop for SteamCMD update
+          MAX_RETRIES=3
+          for ((i=1; i<=MAX_RETRIES; i++)); do
+            echo "SteamCMD update attempt $i/$MAX_RETRIES..."
+            if ./steamcmd.sh +force_install_dir $GITHUB_WORKSPACE/cs16_base +login anonymous +app_update 90 validate +quit; then
+              echo "SteamCMD update successful"
+              break
+            else
+              echo "SteamCMD update failed"
+              if [ $i -eq $MAX_RETRIES ]; then
+                echo "Error: Failed to install CS 1.6 server after $MAX_RETRIES attempts"
+                exit 1
+              fi
+              sleep 10
+            fi
+          done
+          
+          echo "CS 1.6 base server downloaded:"
+          ls -la $GITHUB_WORKSPACE/cs16_base/
+
+      - name: Download all component zips from Release
+        env:
+          GAR_REPO_TOKEN: ${{ secrets.GAR_REPO_TOKEN }}
+        run: |
+          RELEASE_ID="${{ github.event.client_payload.release_id }}"
+          RELEASE_TAG="${{ github.event.client_payload.release_tag }}"
+          
+          echo "Fetching Release info for ID: $RELEASE_ID (tag: $RELEASE_TAG)"
+          
+          # Wait for assets to be available
+          MAX_RETRIES=60
+          RETRY_COUNT=0
+          ASSET_COUNT=0
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            # Get Release info by ID (works for draft releases)
+          RELEASE_INFO=$(curl -s -f \
+            -H "Authorization: token $GAR_REPO_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/fullcone/gar/releases/$RELEASE_ID") || RELEASE_INFO='{"message": "curl failed"}'
+            
+            # Check if release exists
+            if echo "$RELEASE_INFO" | jq -e '.message' > /dev/null 2>&1; then
+               echo "Warning: API returned message: $(echo "$RELEASE_INFO" | jq -r '.message')"
+            else
+               ASSET_COUNT=$(echo "$RELEASE_INFO" | jq -r '.assets | length')
+               echo "Attempt $((RETRY_COUNT+1)): Found $ASSET_COUNT assets"
+               echo "$RELEASE_INFO" | jq -r '"Tag: \(.tag_name), Draft: \(.draft), ID: \(.id)"'
+               
+               if [ "$ASSET_COUNT" -gt 0 ]; then
+                 break
+               fi
+            fi
+            
+            echo "Waiting for assets..."
+            sleep 20
+            RETRY_COUNT=$((RETRY_COUNT+1))
+          done
+          
+          if [ "$ASSET_COUNT" -eq 0 ]; then
+            echo "Error: No assets found in release after $MAX_RETRIES attempts"
+            exit 1
+          fi
+          
+          mkdir -p downloads
+          mkdir -p source-downloads
+          
+          # Download all assets using asset API URL
+          echo "$RELEASE_INFO" | jq -r '.assets[] | "\(.name) \(.url)"' | while read name url; do
+            if [[ "$name" == *"-source.7z" ]]; then
+              echo "Downloading source: $name..."
+              curl -sL -f \
+                -H "Authorization: token $GAR_REPO_TOKEN" \
+                -H "Accept: application/octet-stream" \
+                "$url" -o "source-downloads/$name"
+            elif [[ "$name" == *".7z" ]]; then
+              echo "Downloading component: $name..."
+              curl -sL -f \
+                -H "Authorization: token $GAR_REPO_TOKEN" \
+                -H "Accept: application/octet-stream" \
+                "$url" -o "downloads/$name"
+            fi
+          done
+          
+          echo "Downloaded files:"
+          ls -la downloads/
+          ls -la source-downloads/
+
+      - name: Extract and merge components
+        env:
+          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
+        run: |
+          # Start with CS 1.6 base server
+          echo "Copying CS 1.6 base server..."
+          cp -r $GITHUB_WORKSPACE/cs16_base merged
+          
+          mkdir -p decrypted
+          
+          # Decrypt all component 7z files first
+          for archive in downloads/*.7z; do
+            if [ -f "$archive" ]; then
+              name=$(basename "$archive")
+              echo "Decrypting $name..."
+              7z x -p"${ZIP_PASSWORD}" -o"decrypted/${name%.7z}" "$archive" -y
+            fi
+          done
+          
+          # Extract ReHLDS (top-level files, overwrite base)
+          if [ -d decrypted/rehlds ]; then
+            rsync -a decrypted/rehlds/ merged/
+          fi
+          
+          # Extract other components to cstrike
+          for comp in regamedll metamod reapi reunion revoice amxxeasyhttp; do
+            if [ -d "decrypted/${comp}" ]; then
+              if [ -d "decrypted/${comp}/cstrike" ]; then
+                rsync -a "decrypted/${comp}/cstrike/" merged/cstrike/
+              fi
+            fi
+          done
+          
+          # AMX Mod X special handling
+          if [ -d decrypted/amxmodx ]; then
+            cd decrypted/amxmodx
+            # Save other game directories to source (not in all-in-one)
+            mkdir -p ../../amxmodx_other_games
+            for game in dod esf ns tfc ts; do
+              [ -d "$game" ] && mv "$game" ../../amxmodx_other_games/
+            done
+            # Keep license files (do not delete)
+            # Merge base and cstrike
+            if [ -d "base/addons" ] && [ -d "cstrike/addons" ]; then
+              rsync -a base/addons/ cstrike/addons/ --ignore-existing
+            fi
+            # Copy to merged (including base license files)
+            if [ -d cstrike ]; then
+              rsync -a cstrike/ ../../merged/cstrike/
+            fi
+            # Copy base directory license files to merged root
+            if [ -d base ]; then
+              find base -maxdepth 1 -name "*.txt" -exec cp {} ../../merged/ \;
+            fi
+            cd ../..
+          fi
+          
+          # Generate plugins.ini
+          {
+            echo "; Metamod plugins.ini"
+            echo "linux addons/amxmodx/dlls/amxmodx_mm_i386.so"
+            echo "linux addons/reunion/reunion_mm_i386.so"
+            echo "linux addons/revoice/revoice_mm_i386.so"
+          } > merged/cstrike/addons/metamod/plugins.ini
+          
+          # Generate liblist.gam
+          {
+            echo 'game "Counter-Strike"'
+            echo 'url_info "www.counter-strike.net"'
+            echo 'url_dl ""'
+            echo 'version "1.6"'
+            echo 'size "184000000"'
+            echo 'svonly "0"'
+            echo 'secure "1"'
+            echo 'type "multiplayer_only"'
+            echo 'cldll "1"'
+            echo 'hlversion "1111"'
+            echo 'nomodels "1"'
+            echo 'nohimodel "1"'
+            echo 'mpentity "info_player_start"'
+            echo 'gamedll "dlls\mp.dll"'
+            echo 'gamedll_linux "addons/metamod/metamod_i386.so"'
+            echo 'gamedll_osx "dlls/cs.dylib"'
+            echo 'trainmap "tr_1"'
+            echo 'edicts "1800"'
+          } > merged/cstrike/liblist.gam
+          
+          # Generate random SteamIdHashSalt
+          RANDOM_SALT=$(openssl rand -hex 32)
+          if [ -f merged/cstrike/reunion.cfg ]; then
+            sed -i "s/^SteamIdHashSalt =.*/SteamIdHashSalt = ${RANDOM_SALT}/" merged/cstrike/reunion.cfg
+          fi
+          
+          # 删除不需要的 64 位文件（CS 1.6 服务器只需要 32 位）
+          rm -rf merged/linux64
+          
+          echo "Merged files:"
+          find merged -type f | head -50
+
+      - name: Merge source archives
+        env:
+          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
+        run: |
+          mkdir -p all-sources
+          
+          # Decrypt and extract source archives
+          for archive in source-downloads/*-source.7z; do
+            if [ -f "$archive" ]; then
+              name=$(basename "$archive" -source.7z)
+              echo "Decrypting source: $name..."
+              mkdir -p "all-sources/$name"
+              7z x -p"${ZIP_PASSWORD}" -o"all-sources/$name" "$archive" -y
+            fi
+          done
+          
+          # Add AMX Mod X other game directories to source
+          if [ -d amxmodx_other_games ]; then
+            mkdir -p all-sources/amxmodx-other-games
+            mv amxmodx_other_games/* all-sources/amxmodx-other-games/
+            rmdir amxmodx_other_games
+          fi
+          
+          # Generate BUILD_INFO.txt
+          {
+            echo "=== CS Server Build Source Archive ==="
+            echo "Build Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "Run Number: ${{ github.event.client_payload.run_number }}"
+            echo ""
+            echo "=== Component Versions ==="
+            echo "ReHLDS: ${{ github.event.client_payload.rehlds_version }}"
+            echo "ReGameDLL: ${{ github.event.client_payload.regamedll_version }}"
+            echo "Metamod-R: ${{ github.event.client_payload.metamod_version }}"
+            echo "ReAPI: ${{ github.event.client_payload.reapi_version }}"
+            echo "ReUnion: ${{ github.event.client_payload.reunion_version }}"
+            echo "ReVoice: ${{ github.event.client_payload.revoice_version }}"
+            echo "AMX Mod X: latest"
+            echo "AmxxEasyHttp: latest"
+            echo ""
+            echo "=== Additional Content ==="
+            echo "amxmodx-other-games/: AMX Mod X support for other games (dod, esf, ns, tfc, ts)"
+          } > all-sources/BUILD_INFO.txt
+          
+          echo "Source archives:"
+          ls -la all-sources/
+
+      - name: Create encrypted zip files
+        env:
+          ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
+        run: |
+          # Check if password is set
+          if [ -z "$ZIP_PASSWORD" ]; then
+            echo "Error: ZIP_PASSWORD secret is not set"
+            exit 1
+          fi
+          
+          # Delete root appversion.h (keep component ones)
+          rm -f merged/appversion.h
+          
+          # Encrypt merged server files
+          cd merged
+          7z a -t7z -p"${ZIP_PASSWORD}" -mhe=on ../csserver-all-in-one.7z *
+          cd ..
+          
+          # Encrypt source archives
+          cd all-sources
+          7z a -t7z -p"${ZIP_PASSWORD}" -mhe=on ../csserver-all-sources.7z *
+          cd ..
+          
+          echo "Encrypted 7z files created:"
+          ls -la *.7z
+          
+      - name: Get Release upload URL
+        id: get_upload_url
+        env:
+          GAR_REPO_TOKEN: ${{ secrets.GAR_REPO_TOKEN }}
+        run: |
+          RELEASE_ID="${{ github.event.client_payload.release_id }}"
+          
+          # 带重试获取 upload URL
+          for i in 1 2 3; do
+            UPLOAD_URL=$(curl -s -f \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/fullcone/gar/releases/$RELEASE_ID" \
+              | jq -r '.upload_url' | sed 's/{?name,label}//') && [ -n "$UPLOAD_URL" ] && [ "$UPLOAD_URL" != "null" ] && break
+            echo "API retry $i..."
+            sleep 5
+          done
+          
+          if [ -z "$UPLOAD_URL" ] || [ "$UPLOAD_URL" = "null" ]; then
+            echo "ERROR: Failed to get upload URL"
+            exit 1
+          fi
+          
+          echo "upload_url=$UPLOAD_URL" >> $GITHUB_OUTPUT
+
+      - name: Upload encrypted files to Release
+        env:
+          GAR_REPO_TOKEN: ${{ secrets.GAR_REPO_TOKEN }}
+        run: |
+          UPLOAD_URL="${{ steps.get_upload_url.outputs.upload_url }}"
+          
+          # 上传 csserver-all-in-one.7z（带重试）
+          echo "Uploading csserver-all-in-one.7z..."
+          for i in 1 2 3; do
+            curl -s -f -X POST \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Content-Type: application/x-7z-compressed" \
+              "${UPLOAD_URL}?name=csserver-all-in-one.7z" \
+              --data-binary @csserver-all-in-one.7z && break
+            echo "Upload retry $i..."
+            sleep 5
+          done
+          
+          # 上传 csserver-all-sources.7z（带重试）
+          echo "Uploading csserver-all-sources.7z..."
+          for i in 1 2 3; do
+            curl -s -f -X POST \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Content-Type: application/x-7z-compressed" \
+              "${UPLOAD_URL}?name=csserver-all-sources.7z" \
+              --data-binary @csserver-all-sources.7z && break
+            echo "Upload retry $i..."
+            sleep 5
+          done
+          
+      - name: Publish Release (remove draft)
+        env:
+          GAR_REPO_TOKEN: ${{ secrets.GAR_REPO_TOKEN }}
+        run: |
+          RELEASE_ID="${{ github.event.client_payload.release_id }}"
+          
+          RELEASE_BODY="CS Server Build #${{ github.event.client_payload.run_number }}
+          
+          Build Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          
+          ## Components
+          | Component | Version |
+          |-----------|---------|
+          | ReHLDS | ${{ github.event.client_payload.rehlds_version }} |
+          | ReGameDLL | ${{ github.event.client_payload.regamedll_version }} |
+          | Metamod-R | ${{ github.event.client_payload.metamod_version }} |
+          | ReAPI | ${{ github.event.client_payload.reapi_version }} |
+          | ReUnion | ${{ github.event.client_payload.reunion_version }} |
+          | ReVoice | ${{ github.event.client_payload.revoice_version }} |
+          | AMX Mod X | latest |
+          | AmxxEasyHttp | latest |
+          
+          ## Downloads
+          - **csserver-all-in-one.7z** - Merged complete server files (encrypted)
+          - **csserver-all-sources.7z** - All source archives (encrypted)
+          - Other zip files are individual component builds (unencrypted)
+          
+          > Note: Encrypted files require password to extract"
+          
+          # Update Release info and publish (draft: false)（带重试）
+          for i in 1 2 3; do
+            curl -s -f -X PATCH \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/fullcone/gar/releases/$RELEASE_ID" \
+              -d "{
+                \"body\": $(echo "$RELEASE_BODY" | jq -Rs .),
+                \"draft\": false
+              }" && break
+            echo "API retry $i..."
+            sleep 5
+          done
+          
+          echo ""
+          echo "=== Release published successfully ==="
+          echo "https://github.com/fullcone/gar/releases/tag/${{ github.event.client_payload.release_tag }}"
+
+      - name: Trigger ModelScope upload
+        env:
+          GAR_REPO_TOKEN: ${{ secrets.GAR_REPO_TOKEN }}
+        run: |
+          # 触发私有仓库的 ModelScope 上传 job
+          for i in 1 2 3; do
+            curl -s -f -X POST \
+              -H "Authorization: token $GAR_REPO_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/fullcone/csserver_build/dispatches" \
+              -d '{
+                "event_type": "modelscope-upload",
+                "client_payload": {
+                  "release_id": "${{ github.event.client_payload.release_id }}",
+                  "release_tag": "${{ github.event.client_payload.release_tag }}",
+                  "run_number": "${{ github.event.client_payload.run_number }}"
+                }
+              }' && break
+            echo "Trigger retry $i..."
+            sleep 5
+          done
+          echo "Triggered ModelScope upload workflow"

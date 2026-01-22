@@ -237,7 +237,6 @@ typedef struct client_s
 	int m_sendrescount;
 	qboolean m_bSentNewResponse;
 	movevars_t movevars;
-	uint16 lastcmd_himsec;  // 最后一帧命令的高精度时间（1/256 ms）- 放在末尾以保持二进制兼容性
 } client_t;
 
 enum

@@ -1,0 +1,22 @@
+**/build
+*.iml
+*.bat
+*.log
+*.lnk
+*.aps
+**/msvc/Debug*
+**/msvc/Release*
+**/msvc/Tests
+**/msvc/Test Fixes
+**/msvc/*.sdf
+**/msvc/*.opensdf
+**/msvc/*.user
+**/msvc/*.suo
+**/msvc/*.db
+**/msvc/*.opendb
+**/msvc/*.txt
+**/msvc/*.amplxeproj
+**/msvc/.vs
+**/msvc/ipch
+
+rehlds/version/appversion.h

@@ -76,20 +76,6 @@ clc_func_t sv_clcfuncs[] = {
 	{ clc_endoflist,       "End of List",         nullptr                      },
 };
 
-// ============================================================================
-// 高精度时间戳支持（HiMsec）
-// ============================================================================
-static uint16 g_next_himsec = 0;
-static const uint16* g_himsec_cmds = nullptr;
-static int g_himsec_totalcmds = 0;
-static int g_himsec_numcmds = 0;
-static uint16 g_himsec_smooth[MAX_CLIENTS];
-
-static double HimsecToSeconds(uint16 v)
-{
-	return double(v) / (1000.0 * 256.0);
-}
-
 bool EXT_FUNC SV_CheckConsistencyResponse_API(IGameClient *client, resource_t *res, uint32 hash) {
 	return (hash != *(uint32 *)&res->rgucMD5_hash[0]);
 }
@@ -777,66 +763,23 @@ void SV_RunCmd(usercmd_t *ucmd, int random_seed)
 	edict_t *ent;
 	trace_t trace;
 	float frametime;
-	uint16 local_himsec = g_next_himsec;
 
-	// ============================================================================
-	// ignorecmdtime 处理：优先使用高精度时间
-	// ============================================================================
 	if (host_client->ignorecmdtime > realtime)
 	{
-		if (local_himsec > 0)
-		{
-			// 使用高精度时间
-			host_client->cmdtime = HimsecToSeconds(local_himsec) + host_client->cmdtime;
-		}
-		else
-		{
-			// 回退到低精度
-			host_client->cmdtime = (double)ucmd->msec / 1000.0 + host_client->cmdtime;
-		}
+		host_client->cmdtime = (double)ucmd->msec / 1000.0 + host_client->cmdtime;
 		return;
 	}
 
-	host_client->ignorecmdtime = 0;
 
-	// ============================================================================
-	// 大帧分割：优先检查高精度时间，保持和 msec 一样的分割逻辑
-	// ============================================================================
-	if (local_himsec > 0)
+	host_client->ignorecmdtime = 0;
+	if (cmd.msec > 50)
 	{
-		// 使用高精度时间进行分割判断（50ms = 50 * 256）
-		if (local_himsec > 50 * 256)
-		{
-			uint16 half_himsec = local_himsec / 2;
-			
-			// 第一次递归：前半帧
-			g_next_himsec = half_himsec;
-			cmd.msec = (byte)(ucmd->msec / 2.0);
-			SV_RunCmd(&cmd, random_seed);
-			
-			// 第二次递归：后半帧
-			g_next_himsec = half_himsec;
-			cmd.msec = (byte)(ucmd->msec / 2.0);
-			cmd.impulse = 0;
-			SV_RunCmd(&cmd, random_seed);
-			
-			// 恢复原值
-			g_next_himsec = local_himsec;
-			return;
-		}
-	}
-	else
-	{
-		// 回退到低精度 msec 分割
-		if (cmd.msec > 50)
-		{
-			cmd.msec = (byte)(ucmd->msec / 2.0);
-			SV_RunCmd(&cmd, random_seed);
-			cmd.msec = (byte)(ucmd->msec / 2.0);
-			cmd.impulse = 0;
-			SV_RunCmd(&cmd, random_seed);
-			return;
-		}
+		cmd.msec = (byte)(ucmd->msec / 2.0);
+		SV_RunCmd(&cmd, random_seed);
+		cmd.msec = (byte)(ucmd->msec / 2.0);
+		cmd.impulse = 0;
+		SV_RunCmd(&cmd, random_seed);
+		return;
 	}
 
 
@@ -852,32 +795,9 @@ void SV_RunCmd(usercmd_t *ucmd, int random_seed)
 #endif
 
 	gEntityInterface.pfnCmdStart(sv_player, ucmd, random_seed);
-	
-	// ============================================================================
-	// frametime 计算：优先使用高精度时间
-	// ============================================================================
-	if (local_himsec > 0)
-	{
-		frametime = HimsecToSeconds(local_himsec);
-	}
-	else
-	{
-		frametime = float(ucmd->msec * 0.001);
-	}
-	
+	frametime = float(ucmd->msec * 0.001);
 	host_client->svtimebase = frametime + host_client->svtimebase;
-	
-	// ============================================================================
-	// cmdtime 更新：优先使用高精度时间
-	// ============================================================================
-	if (local_himsec > 0)
-	{
-		host_client->cmdtime = HimsecToSeconds(local_himsec) + host_client->cmdtime;
-	}
-	else
-	{
-		host_client->cmdtime = ucmd->msec / 1000.0 + host_client->cmdtime;
-	}
+	host_client->cmdtime = ucmd->msec / 1000.0 + host_client->cmdtime;
 	if (ucmd->impulse)
 	{
 		sv_player->v.impulse = ucmd->impulse;
@@ -1613,59 +1533,26 @@ void SV_EstablishTimeBase_internal(client_t *cl, usercmd_t *cmds, int dropped, i
 
 		int droppedcmds = dropped;
 
-		// ============================================================================
-		// 丢包补偿：优先使用 lastcmd_himsec
-		// ============================================================================
+		// Run the last known cmd for each dropped cmd we don't have a backup for
 		while (droppedcmds > numbackup)
 		{
-			if (cl->lastcmd_himsec > 0)
-			{
-				// 使用高精度时间
-				runcmd_time += HimsecToSeconds(cl->lastcmd_himsec);
-			}
-			else
-			{
-				// 回退到低精度
-				runcmd_time += cl->lastcmd.msec / 1000.0;
-			}
+			runcmd_time += cl->lastcmd.msec / 1000.0;
 			droppedcmds--;
 		}
 
-		// ============================================================================
-		// 备份命令时间：优先使用 himsec
-		// ============================================================================
+		// Now run the "history" commands if we still have dropped packets
 		while (droppedcmds > 0)
 		{
 			int cmdnum = numcmds + droppedcmds - 1;
-			if (g_himsec_cmds && g_himsec_cmds[cmdnum] > 0)
-			{
-				// 使用高精度时间
-				runcmd_time += HimsecToSeconds(g_himsec_cmds[cmdnum]);
-			}
-			else
-			{
-				// 回退到低精度
-				runcmd_time += cmds[cmdnum].msec / 1000.0;
-			}
+			runcmd_time += cmds[cmdnum].msec / 1000.0;
 			droppedcmds--;
 		}
 	}
 
-	// ============================================================================
-	// 新命令总时间：优先使用 himsec
-	// ============================================================================
+	// Now run any new command(s). Go backward because the most recent command is at index 0
 	for (i = numcmds - 1; i >= 0; i--)
 	{
-		if (g_himsec_cmds && g_himsec_cmds[i] > 0)
-		{
-			// 使用高精度时间
-			time_at_end += HimsecToSeconds(g_himsec_cmds[i]);
-		}
-		else
-		{
-			// 回退到低精度
-			time_at_end += cmds[i].msec / 1000.0;
-		}
+		time_at_end += cmds[i].msec / 1000.0;
 	}
 
 	cl->svtimebase = host_frametime + g_psv.time - (time_at_end + runcmd_time);
@@ -1734,63 +1621,6 @@ void SV_ParseMove(client_t *pSenderClient)
 		from = &cmds[i];
 	}
 
-	// ============================================================================
-	// 读取高精度时间戳数据（HiMsec）
-	// ============================================================================
-	int clc_end = placeholder + 1 + mlen;
-	uint16 himsec_vals[64];
-	int hiMsecActive = 0;
-	qboolean hasHiMsec = FALSE;
-	
-	Q_memset(himsec_vals, 0, sizeof(himsec_vals));
-	
-	// 检查客户端是否支持高精度
-	hasHiMsec = Q_atoi(Info_ValueForKey(host_client->userinfo, "*himsec")) == 1;
-	
-	// 尝试读取高精度数据
-	if ((clc_end - msg_readcount) >= 2)
-	{
-		int himsecCount = MSG_ReadShort();
-		if (himsecCount > 0)
-		{
-			if (himsecCount > totalcmds)
-				himsecCount = totalcmds;
-			if ((clc_end - msg_readcount) < himsecCount * 2)
-			{
-				msg_badread = 1;
-				return;
-			}
-			for (int i = totalcmds - 1; i >= 0; i--)
-			{
-				if (i >= totalcmds - himsecCount)
-				{
-					himsec_vals[i] = MSG_ReadShort();
-					// 不在这里限制，让 SV_RunCmd 处理分割（和 msec 逻辑一致）
-				}
-				else
-				{
-					// 对于没有高精度数据的帧，复制下一帧的值
-					himsec_vals[i] = himsec_vals[i + 1];
-				}
-			}
-			hiMsecActive = 1;
-		}
-		else
-		{
-			msg_badread = 1;
-			return;
-		}
-	}
-	else
-	{
-		msg_badread = 1;
-		return;
-	}
-	
-	// 调整读取位置到数据包末尾
-	if (msg_readcount < clc_end)
-		msg_readcount = clc_end;
-
 	if (!g_psv.active || !(host_client->active || host_client->spawned))
 		return;
 
@@ -1855,36 +1685,17 @@ void SV_ParseMove(client_t *pSenderClient)
 	sv_player->v.button = cmds[0].buttons;
 	sv_player->v.light_level = cmds[0].lightlevel;
 #endif
-	
-	// ============================================================================
-	// 设置高精度时间戳全局变量
-	// ============================================================================
-	if (hiMsecActive)
-	{
-		g_himsec_cmds = himsec_vals;
-		g_himsec_totalcmds = totalcmds;
-		g_himsec_numcmds = numcmds;
-	}
-	
 	SV_EstablishTimeBase(host_client, cmds, net_drop, numbackup, numcmds);
-	
-	// 清理全局变量
-	g_himsec_cmds = nullptr;
-	g_himsec_totalcmds = 0;
-	g_himsec_numcmds = 0;
-	
 	if (net_drop < 24)
 	{
 		while (net_drop > numbackup)
 		{
-			g_next_himsec = 0;
 			SV_RunCmd(&host_client->lastcmd, 0);
 			net_drop--;
 		}
 
 		while (net_drop > 0)
 		{
-			g_next_himsec = hiMsecActive ? himsec_vals[numcmds + net_drop - 1] : 0;
 			SV_RunCmd(&cmds[numcmds + net_drop - 1], host_client->netchan.incoming_sequence - (numcmds + net_drop - 1));
 			net_drop--;
 		}
@@ -1893,40 +1704,19 @@ void SV_ParseMove(client_t *pSenderClient)
 
 	for (int i = numcmds - 1; i >= 0; i--)
 	{
-		g_next_himsec = hiMsecActive ? himsec_vals[i] : 0;
 		SV_RunCmd(&cmds[i], host_client->netchan.incoming_sequence - i);
 	}
 
 #ifdef REHLDS_FIXES
 	if (numcmds)
-	{
 		host_client->lastcmd = cmds[numcmds - 1];
-		// 保存最后一帧的高精度时间
-		host_client->lastcmd_himsec = hiMsecActive ? himsec_vals[numcmds - 1] : 0;
-	}
 	else if (numbackup)
-	{
 		host_client->lastcmd = cmds[0];
-		// 保存备份命令的高精度时间
-		host_client->lastcmd_himsec = hiMsecActive ? himsec_vals[0] : 0;
-	}
 #else
 	host_client->lastcmd = cmds[0];
-	host_client->lastcmd_himsec = hiMsecActive ? himsec_vals[0] : 0;
 #endif
 
-	// ============================================================================
-	// Ping 计算：优先使用高精度时间
-	// ============================================================================
-	if (host_client->lastcmd_himsec > 0)
-	{
-		frame->ping_time -= HimsecToSeconds(host_client->lastcmd_himsec) * 0.5f;
-	}
-	else
-	{
-		frame->ping_time -= float(host_client->lastcmd.msec * 0.5 / 1000.0);
-	}
-	
+	frame->ping_time -= float(host_client->lastcmd.msec * 0.5 / 1000.0);
 	if (frame->ping_time < 0.0)
 		frame->ping_time = 0;
 
